@@ -8,6 +8,12 @@ import { DEFAULT_SCRIPT_TIMEOUT_MS, FULL_TESTS, QUICK_TESTS } from './test-suite
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+/** `QQ_BRIDGE_TEST_EXCLUDE="a.mjs,b.mjs"` → ['a.mjs','b.mjs']（空/未设为空数组）。 */
+export function parseExclude(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
 export const SUITES = {
   full: { tests: FULL_TESTS, title: 'Audit suite' },
   quick: { tests: QUICK_TESTS, title: 'Quick suite' }
@@ -28,9 +34,20 @@ export function runScripts(scripts, {
   timeoutMs = DEFAULT_SCRIPT_TIMEOUT_MS,
   stdio = 'inherit',
   log = console.log,
-  errorLog = console.error
+  errorLog = console.error,
+  exclude = parseExclude(process.env.QQ_BRIDGE_TEST_EXCLUDE)
 } = {}) {
   if (!Array.isArray(scripts) || scripts.length === 0) throw new Error('测试清单为空');
+  // 显式排除（CI 上用）：只排除"需要本机 Windows / 本机 DSH 安装"的少数脚本，
+  // 清单写在 .github/workflows/ci.yml 里，跑的时候把被排除的名字打出来 —— 不静默。
+  const filtered = exclude.length ? scripts.filter((s) => !exclude.includes(s)) : scripts;
+  // 只统计**实际命中**的排除项：env 里列了本套件里不存在的名字时，不该虚报 excluded，
+  // 否则 `excluded` 的语义会从"这次少跑了几个"退化成"env 里写了几个"。
+  const excludedHit = exclude.length ? scripts.filter((s) => exclude.includes(s)) : [];
+  if (excludedHit.length) log(`\n[runner] 按 QQ_BRIDGE_TEST_EXCLUDE 排除 ${excludedHit.length} 项：${excludedHit.join(', ')}`);
+  const excludedCount = excludedHit.length;
+  scripts = filtered;
+  if (scripts.length === 0) throw new Error('排除后测试清单为空');
   let failed = 0;
   for (const script of scripts) {
     log(`\nRunning ${script}`);
@@ -45,7 +62,7 @@ export function runScripts(scripts, {
       errorLog(`FAILED ${script}: ${result.error?.message || `exit ${result.status}`}`);
     }
   }
-  return { total: scripts.length, failed, passed: scripts.length - failed };
+  return { total: scripts.length, failed, passed: scripts.length - failed, excluded: excludedCount };
 }
 
 // CLI 入口共用：选择套件、跑、打印总结、把失败/超时映射成退出码 1。

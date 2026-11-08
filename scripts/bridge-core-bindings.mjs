@@ -19,5 +19,8 @@ export * from '../src/core/dsh-connection-watch.mjs';
 export * from '../src/core/send-gaps.mjs';
 export * from '../src/core/tool-log-format.mjs';
 export * from '../src/core/memory-text.mjs';
+export * from '../src/core/memory-budget.mjs';
+export * from '../src/core/tts-voices.mjs';
+export * from '../src/core/wake-time-scale.mjs';
 export * from '../src/core/runtime-records.mjs';
 export * from '../src/console/role-routes.mjs';

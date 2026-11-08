@@ -1,11 +1,27 @@
-// 控制台增强功能综合测试（node 直接调 API）
+// 控制台增强功能综合测试（node 直接调 API）——**默认 dry-run**。
+//
+// 为什么默认跳过：这个脚本会 ① 打真实的 127.0.0.1:3100；② 改写 config.json 的白名单；
+// ③ 通过 /api/test-send 真的往 QQ 发一条消息；④ 删掉 roles/ 下的测试人格文件（那文件是
+// git 跟踪的，跑一次就把工作区改了）。`npm run test-console` 以前会静默做完这四件事，
+// 现在必须显式 opt-in：
+//
+//   QQ_BRIDGE_CONSOLE_LIVE=1 node scripts/test-console.mjs
+//   CONSOLE_BASE=http://127.0.0.1:3999 QQ_BRIDGE_CONSOLE_LIVE=1 node scripts/test-console.mjs
+//
+// 对真实实例做验证时，建议先复制一份 config/state 到临时目录，用单独的端口跑起来。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const BASE = 'http://127.0.0.1:3100';
+const BASE = process.env.CONSOLE_BASE || 'http://127.0.0.1:3100';
+const LIVE = process.env.QQ_BRIDGE_CONSOLE_LIVE === '1';
+if (!LIVE) {
+  console.log('⏭  跳过：控制台综合测试会改真实配置并往 QQ 发消息。');
+  console.log('   需要时显式开启：QQ_BRIDGE_CONSOLE_LIVE=1 node scripts/test-console.mjs');
+  process.exit(0);
+}
 
 function readConsoleToken() {
   try {
@@ -43,6 +59,11 @@ ok('角色列表', r.body.roles?.includes('傲娇助手'), JSON.stringify(r.body
 
 // 3. 创建人格
 const TEST_ROLE = '测试人格Tmp';
+// 跑之前先把原文件内容记下来：仓库里本来就有这张卡（git 跟踪），清场时必须还原而不是删掉。
+const roleBackup = (() => {
+  try { return fs.readFileSync(new URL(`../roles/${TEST_ROLE}.md`, import.meta.url), 'utf8'); }
+  catch { return null; }
+})();
 r = await api('/api/roles/create', 'POST', { name: TEST_ROLE, content: '- 性格：测试\n- 说话风格：简短' });
 ok('创建人格', r.body.ok === true, JSON.stringify(r.body));
 r = await api('/api/roles');
@@ -95,8 +116,17 @@ await api('/api/whitelist', 'POST', { allow: origAllow, deny: { private: [], gro
 r = await api('/api/test-send', 'POST', { kind: 'group', id: '100003', message: 'x' });
 ok('非白名单发送被拒', r.body.ok === false && r.status === 403, JSON.stringify(r.body));
 
-// 10. 清理测试人格（用绝对路径，不依赖运行目录）
-fs.rmSync(new URL(`../roles/${TEST_ROLE}.md`, import.meta.url), { force: true });
+// 10. 清理测试人格（用绝对路径，不依赖运行目录）。
+//     先看它本来在不在：仓库里确实有一张 `roles/测试人格Tmp.md`（git 跟踪），
+//     无条件 rmSync 会在跑测试时把它删掉 —— 现在改成"原来有就还原内容，原来没有才删"。
+{
+  const roleFile = new URL(`../roles/${TEST_ROLE}.md`, import.meta.url);
+  if (roleBackup !== null) {
+    fs.writeFileSync(roleFile, roleBackup);
+  } else {
+    fs.rmSync(roleFile, { force: true });
+  }
+}
 r = await api('/api/roles');
 ok('测试人格已清理', !r.body.roles?.includes(TEST_ROLE));
 

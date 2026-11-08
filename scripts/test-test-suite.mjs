@@ -114,7 +114,8 @@ test('runner：串行执行、通过/失败计数与 FAILED 文案', () => {
       log: (line) => lines.push(line),
       errorLog: (line) => errors.push(line)
     });
-    assert.deepEqual(result, { total: 2, failed: 1, passed: 1 });
+    // runner 现在还会回报 excluded 数（CI 用 QQ_BRIDGE_TEST_EXCLUDE 显式排除少数脚本）。
+    assert.deepEqual(result, { total: 2, failed: 1, passed: 1, excluded: 0 });
     assert.deepEqual(lines, ['\nRunning pass.mjs', '\nRunning fail.mjs']);
     assert.equal(errors.length, 1);
     assert.match(errors[0], /^FAILED fail\.mjs: exit 3$/);

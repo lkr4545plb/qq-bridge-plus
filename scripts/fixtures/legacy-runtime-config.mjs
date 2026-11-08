@@ -69,6 +69,9 @@ export function createLegacyRuntimeConfig({ file, configPath = 'X/config.json' }
     const cfg = {
       dsh: {
         baseUrl: 'http://127.0.0.1:3080',
+        // 冻结基线同步：事件流的两个 deadline（握手 10s；空闲默认 0=不启用）。
+        muxHandshakeTimeoutMs: 10000,
+        muxIdleTimeoutMs: 0,
         provider: 'deepseek-official',
         model: 'deepseek-flash',
         reasoningEffort: 'max',
@@ -96,6 +99,13 @@ export function createLegacyRuntimeConfig({ file, configPath = 'X/config.json' }
       sendDelayMs: file.sendDelayMs ?? 300,
       questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
       consolePort: file.consolePort ?? 3100,
+      // 冻结基线同步：新增 alerts（掉线告警）。
+      alerts: {
+        webhookUrl: '',
+        offlineThresholdPolls: 3,
+        cooldownMs: 30 * 60_000,
+        ...((file.alerts && typeof file.alerts === 'object' && !Array.isArray(file.alerts)) ? file.alerts : {})
+      },
       consoleToken: file.consoleToken ?? '',
       pricing: file.pricing ?? null,
       security: {
@@ -181,6 +191,7 @@ export function createLegacyRuntimeConfig({ file, configPath = 'X/config.json' }
         },
         wake: {
           defaultMode: 'diving',
+          promptDedupe: { enabled: true, repeatEvery: 4 },
           preSleepWaitEnabled: true,
           preSleepWaitMs: 300000,
           recommendedDefaultInfinite: true,
@@ -260,6 +271,25 @@ export function createLegacyRuntimeConfig({ file, configPath = 'X/config.json' }
         tieba: {
           cookieFile: ''
         },
+        // 冻结基线同步：新增 socialV2.wakeTimeScale（唤醒概率的时段缩放）。同上，只补"当前定义下
+        // 旧实现应产出什么"，历史字段一律不动。
+        wakeTimeScale: {
+          enabled: true,
+          sleep: { enabled: true, startHour: 0, endHour: 8, scale: 0.2 },
+          dsPeak: { enabled: true, scale: 0.5 }
+        },
+        // 冻结基线同步：新增 socialV2.state（落盘合并窗口）与 wake.promptDedupe（提示去重）。
+        state: { saveDebounceMs: 400 },
+        // 冻结基线同步：新增 socialV2.memory（记忆注入预算）。这里不改历史字段，
+        // 只把「旧实现按当前定义应产出什么」补齐，差分测试才能继续当回归用。
+        memory: {
+          maxInjectChars: 1800,
+          traitsRenderMax: 4,
+          snapshotEnabled: true,
+          snapshotKeepDays: 30,
+          impressionRenderUid: true,
+          ...((file.socialV2 && typeof file.socialV2 === 'object' && !Array.isArray(file.socialV2) && file.socialV2.memory) || {})
+        },
         ...(file.socialV2 ?? {})
       }
     };
@@ -300,8 +330,39 @@ export function createLegacyRuntimeConfig({ file, configPath = 'X/config.json' }
       ...(cfg.socialV2.tools ?? {})
     };
 
+    // 本地图片库（表情包）：qq_send_image 的 file 参数只允许取这些目录里的图片。
+    // 留空 = 用默认（dsh-meme 插件自带的 memes 根目录）。
+    cfg.socialV2.image = {
+      libraryDirs: [],
+      ...(cfg.socialV2?.image ?? {})
+    };
+
     cfg.socialV2.voice = {
+      transcribe: {
+        enabled: true,
+        timeoutMs: 1500,
+        engine: 'auto',
+        local: {
+          enabled: true,
+          silkDecoder: '/opt/local-asr/bin/silk-decoder',
+          whisperBin: '/opt/local-asr/bin/whisper-cli',
+          model: '/opt/local-asr/models/ggml-base.bin',
+          libPath: '/opt/local-asr/bin',
+          language: 'zh',
+          timeoutMs: 120000
+        }
+      },
       enabled: false,
+    // TTS（文字合成语音）参数。voice 是默认音色，单次调用可用 qq_send_speech 的 voice 覆盖；
+    // rate/volume 为百分比（如 +10%），pitch 为 Hz（如 +5Hz），留空即不传。
+    tts: {
+      voice: 'zh-CN-XiaoxiaoNeural',
+      python: 'python3',
+      timeoutMs: 30000,
+      rate: '',
+      pitch: '',
+      volume: ''
+    },
       dir: 'audio',
       maxSeconds: 300,
       maxBytes: 20 * 1024 * 1024,

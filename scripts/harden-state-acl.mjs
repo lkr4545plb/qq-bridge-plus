@@ -17,6 +17,10 @@
 // 加上回读自检被 Low 完整性标签行的 (I) 误判，导致**每次启动都重跑一次这个破坏性命令**。
 // 合并成一份，从结构上杜绝再次漂移。
 //
+// 第三个同类缺陷（中文 Windows 上把"收紧失败"判成成功）不在本文件，修在共用模块里：
+// 失败文本判定现在同时认英文与中文（含退出码/stderr），授权对象改用 well-known SID。
+// 本文件额外加了一道**独立回读**：hardenDir 报成功后再只读地查一次 isHardened。
+//
 // 用法：node scripts/harden-state-acl.mjs [--quiet]
 //   --quiet 时只在真正做了事情/失败时输出（start.bat 用这个模式）。
 
@@ -110,6 +114,16 @@ if (!result.ok && !isElevatedRun) {
 }
 
 if (result.ok) {
+  // 独立回读：hardenDir 报成功不算数，再只读地查一次。
+  // 中文 Windows 上曾经出现过「命令跑完 = 报成功」的假安全（失败判定只认英文
+  // access is denied，而中文输出是「拒绝访问」）；这里加一道与 harden 无关的回读，
+  // 就算哪天真判定又漏了，也不会把"未收紧"显示成"已收紧"。
+  if (!isHardened(STATE_DIR)) {
+    sayAlways('[harden-acl] ⚠️ 收紧命令已执行，但回读仍显示 state/ 未收紧（权限可能被上层继承重新带回）。');
+    sayAlways('[harden-acl] 请用管理员终端手动执行下面这几条命令（一次即可）：');
+    sayAlways(`             ${manualDirCommand(STATE_DIR)}`);
+    process.exit(0);
+  }
   sayAlways('[harden-acl] ✅ 已收紧 state/ 权限（只保留当前用户 / SYSTEM / Administrators）。');
   process.exit(0);
 }

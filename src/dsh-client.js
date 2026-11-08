@@ -126,8 +126,18 @@ export function mintBrowserSessionCookie(baseUrl, secret, { lifetimeMs = MINTED_
     version: COOKIE_PAYLOAD_VERSION, authority, issuedAt, expiresAt
   }), 'utf8'));
   const signature = base64url(createHmac('sha256', secret).update(body).digest());
-  const name = COOKIE_PREFIX + base64url(createHash('sha256').update(authority).digest());
-  return `${name}=v1.${body}.${signature}`;
+  const value = `v1.${body}.${signature}`;
+  // Cookie **名字**在 DSH 侧有两种口径：
+  //   · 原版：hash(authority)，authority 含端口（`host:port`）；
+  //   · 被 dsh-purge 的 `cookie-name-ignore-port` 补丁改过的版本：hash(去掉端口)。
+  // 载荷里的 authority 两种口径都要求**带端口**（HTTP 监听下 `requestAudience` 返回 url.host），
+  // 所以这里把两个名字都发出去：DSH 按自己的口径取其中一个，另一个被忽略。
+  // 这样同一份代码对打过/没打过补丁的 DSH 都能用，不需要额外开关。
+  const nameWithPort = COOKIE_PREFIX + base64url(createHash('sha256').update(authority).digest());
+  const noPort = String(authority).replace(/:\d+$/, '');
+  if (noPort === authority) return `${nameWithPort}=${value}`;
+  const nameNoPort = COOKIE_PREFIX + base64url(createHash('sha256').update(noPort).digest());
+  return `${nameWithPort}=${value}; ${nameNoPort}=${value}`;
 }
 
 /**
@@ -151,6 +161,37 @@ export function discoverDshSessionCookie(baseUrl, options) {
  * 一旦发往非回环地址就等于把凭据交给中途的任何一环（代理日志、抓包、对端记录）。
  * 所以默认只允许回环，远程部署需要显式 opt-in。
  */
+/**
+ * DSH 是否在**本机**（回环地址，或本机某个网络接口地址）。
+ *
+ * 为什么需要比 `isLoopbackBase` 更宽：DSH Desktop / `dsh web --host <lan-ip>` 常常绑在
+ * 本机的 LAN 地址上（WSL2、容器、云主机内网 IP 都这样），此时 baseUrl 不是 127.x，
+ * 但机器还是这台机器 —— 用本机 `.credentials.yaml` 里的签名密钥给它铸 Cookie 是成立的。
+ *
+ * 只用于**铸造 Cookie** 这条路径。launch token 仍然只允许发往回环（那是进程启动凭据，
+ * 泄露面更大），见 ensureAuth 里的 allowRemote 检查。
+ */
+export function isLocalDshBase(baseUrl) {
+  if (isLoopbackBase(baseUrl)) return true;
+  try {
+    const host = new URL(String(baseUrl)).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    const families = os.networkInterfaces();
+    for (const list of Object.values(families)) {
+      for (const info of list ?? []) {
+        const addr = String(info?.address ?? '').toLowerCase();
+        if (!addr) continue;
+        // IPv4 直接比；IPv6 去掉 zone（fe80::1%eth0）后比，并兼容 IPv4-mapped。
+        const bare = addr.split('%')[0];
+        if (bare === host) return true;
+        if (bare.startsWith('::ffff:') && bare.slice(7) === host) return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function isLoopbackBase(baseUrl) {
   try {
     const u = new URL(String(baseUrl));
@@ -199,6 +240,58 @@ function endpointOf(method) {
  * 该值只影响首帧大小，不影响后续增量事件。
  */
 export const FOLLOW_SNAPSHOT_MESSAGES = 200;
+
+/**
+ * `remote.mux` 的**握手超时**（毫秒）：从建连到收到**第一帧**的预算。
+ *
+ * 为什么必须有：半开的对端（进程被挂起、NAT 表项过期、防火墙静默丢包）不会发 FIN/RST，
+ * 于是 `for await` 既拿不到帧也不抛错，调用方的 catch/finally/重连全都不触发 ——
+ * 现象是「DSH 在线但一条事件都收不到」，而且没有任何日志。
+ */
+export const MUX_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/**
+ * `remote.mux` 的**空闲超时**（毫秒）：连上之后连续多久没收到任何帧就判定为半开。
+ *
+ * 取 90s：DSH 在空闲会话上也会周期性下发 `$events` 的 emit/keepalive 类帧，
+ * 90s 足够宽松（不会误杀正常的安静群），又远小于「会话永久 busy」的看门狗阈值。
+ */
+export const MUX_IDLE_TIMEOUT_MS = 90_000;
+
+/** 超时下限：防止把超时配成 0/负数，变成「一建连就失败」。 */
+const MUX_TIMEOUT_MIN_MS = 10;
+
+/**
+ * 超时错误的 `code`。调用方要区分两种情况：
+ *   · 「流不再可用」（超时）—— 对 MCP 的轮询兜底来说等价于「流结束」，不该整单失败；
+ *   · 「流坏了」（stream/error、鉴权失败）—— 需要上抛。
+ * 只靠 message 文本判断太脆，所以给一个稳定的 code。
+ */
+export const MUX_HANDSHAKE_TIMEOUT_CODE = 'mux/handshake-timeout';
+export const MUX_IDLE_TIMEOUT_CODE = 'mux/idle-timeout';
+
+const muxTimeoutError = (code, message) => Object.assign(new Error(message), { code });
+
+/** 归一化一个超时值：非有限/非正数回默认，其余夹到下限并取整。 */
+function muxTimeoutOf(value, fallback) {
+  // `null` 是**显式关闭**的哨兵（返回 null，调用方据此不装计时器）。
+  // 这一点很重要：DSH 在安静时段本来就可能几小时不发帧，空闲超时一旦误开
+  // 就会变成"每 ~93 秒重连一次 + 清空在途 collector + 重发 follow 快照"，
+  // 比半开连接更糟。0/负数仍按"没配"处理，回落到默认值。
+  if (value === null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.max(MUX_TIMEOUT_MIN_MS, Math.round(n));
+}
+
+/** 从 `events.mux(payload)` 的 payload 里取超时配置（未提供则留 undefined，由生成器补默认值）。 */
+function muxTimeoutsFromPayload(payload) {
+  if (!payload || typeof payload !== 'object') return {};
+  return {
+    handshakeTimeoutMs: payload.handshakeTimeoutMs,
+    idleTimeoutMs: payload.idleTimeoutMs
+  };
+}
 
 /**
  * 从一份 Session 投影值里取出待处理的 inbox 项（`next-turn` + `next-step`）。
@@ -664,7 +757,8 @@ export class NodeApiClient extends AbstractApiClient {
     const secret = this.browserSessionSecret();
     // 铸造只对回环地址成立：签名密钥取自本机 DSH_HOME，远程 DSH 用的是另一份密钥，
     // 拿本机密钥去签只会换来 401。
-    const canMint = secret !== null && isLoopbackBase(this.baseUrl);
+    // 用「本机」而不是「回环」：dsh web --host <lan-ip> 是常见部署，机器还是这台机器。
+    const canMint = secret !== null && isLocalDshBase(this.baseUrl);
     // 优先级：默认**铸造优先**——它不依赖「启动器有没有把 stdout 记进日志」，也不随
     // DSH 重启失效，是唯一不需要每次升级重新适配的一条路。两个例外：
     // 用户在 config.json 里显式填了 dsh.authToken（那是明确意图，尊重它），
@@ -925,8 +1019,10 @@ export class NodeApiClient extends AbstractApiClient {
    * session/follow 的 event 帧映射成旧 pumpMux 能消费的 session/event 信封。
    */
   events = {
-    mux: (_payload, signal, onOpen) => this.openRemoteEventStream(signal, onOpen),
-    host: (_payload, signal, onOpen) => this.openRemoteEventStream(signal, onOpen),
+    // 超时可由 payload 覆盖（`{ handshakeTimeoutMs, idleTimeoutMs }`）；不传就用模块默认值。
+    // 桥接侧若要按需放宽/收紧，只改调用参数即可，不必再动这里。
+    mux: (payload, signal, onOpen) => this.openRemoteEventStream(signal, onOpen, muxTimeoutsFromPayload(payload)),
+    host: (payload, signal, onOpen) => this.openRemoteEventStream(signal, onOpen, muxTimeoutsFromPayload(payload)),
     follow: (sessionId) => this._followSession(sessionId),
     /**
      * 取消一个会话的订阅（会话被退役/重置时调用）。
@@ -942,8 +1038,8 @@ export class NodeApiClient extends AbstractApiClient {
     },
   };
 
-  openRemoteEventStream(signal, onOpen) {
-    const gen = this._remoteMuxGenerator(signal, onOpen);
+  openRemoteEventStream(signal, onOpen, opts = {}) {
+    const gen = this._remoteMuxGenerator(signal, onOpen, opts);
     return {
       [Symbol.asyncIterator]: () => gen,
       follow: (sessionId) => this._followSession(sessionId),
@@ -959,7 +1055,9 @@ export class NodeApiClient extends AbstractApiClient {
     if (this._muxSendOpen) this._muxSendOpen(sid);
   }
 
-  async *_remoteMuxGenerator(signal, onOpen) {
+  async *_remoteMuxGenerator(signal, onOpen, opts = {}) {
+    const handshakeTimeoutMs = muxTimeoutOf(opts?.handshakeTimeoutMs, MUX_HANDSHAKE_TIMEOUT_MS);
+    const idleTimeoutMs = muxTimeoutOf(opts?.idleTimeoutMs, MUX_IDLE_TIMEOUT_MS);
     const own = signal === undefined ? new AbortController() : undefined;
     const sig = signal ?? own.signal;
     sig.throwIfAborted();
@@ -982,13 +1080,53 @@ export class NodeApiClient extends AbstractApiClient {
       wake?.();
       wake = undefined;
     };
-    const endStream = () => {
-      if (ended) return;
+    // 握手/空闲计时器。两个都必须 unref()：它们只是「诊断用的定时炸弹」，
+    // 绝不该成为进程退出的阻碍；同时必须在 finally 里清掉，否则流结束后还会再响一次。
+    let handshakeTimer = null;
+    let idleTimer = null;
+    let handshakeDone = false;
+    const clearTimer = (handle) => {
+      if (handle !== null && handle !== undefined) clearTimeout(handle);
+      return null;
+    };
+    // 「已结束」的**标记与清理**（不含入队）：endStream 与 failStream 共用同一份，
+    // 保证两条路径的副作用逐字一致（复位 _muxSendOpen + 丢弃旧 Cookie）。
+    const markEnded = () => {
+      if (ended) return false;
       ended = true;
       if (this._muxSendOpen === sendOpen) this._muxSendOpen = null;
       // 连接断开（含鉴权失败/DSH 重启）时丢弃旧 Cookie，重连会重新 token exchange。
       if (!sig.aborted) this.invalidateAuth();
-      enqueue({ kind: 'end' });
+      return true;
+    };
+    const endStream = () => {
+      if (markEnded()) enqueue({ kind: 'end' });
+    };
+    /**
+     * 异常结束（握手/空闲超时）：清理照旧走 markEnded，但入队的是错误项 ——
+     * 消费侧因此会 throw，调用方拿到的是**明确原因**而不是「对端正常关闭」。
+     */
+    const failStream = (error) => {
+      if (markEnded()) enqueue({ kind: 'error', error });
+    };
+    /**
+     * 每收到一帧：结束握手阶段 + 重置空闲计时。
+     *
+     * 任何帧（包括畸形帧）都证明对端还活着，所以这一步放在解析**之前**。
+     */
+    const noteFrameReceived = () => {
+      if (!handshakeDone) {
+        handshakeDone = true;
+        handshakeTimer = clearTimer(handshakeTimer);
+      }
+      idleTimer = clearTimer(idleTimer);
+      if (idleTimeoutMs !== null) {
+        idleTimer = setTimeout(() => {
+          idleTimer = null;
+          failStream(muxTimeoutError(MUX_IDLE_TIMEOUT_CODE, `DSH 事件流空闲超时（${idleTimeoutMs}ms）：连接还在，但长时间没有收到任何帧（对端可能已半开）`));
+        }, idleTimeoutMs);
+        idleTimer?.unref?.();
+      }
     };
     const sendOpen = (sessionId) => {
       if (ended || !socketOpen || sessionToStream.has(sessionId) || followed.has(sessionId)) return;
@@ -1049,6 +1187,8 @@ export class NodeApiClient extends AbstractApiClient {
       if (!ended) onOpen?.();
     };
     const handleMessage = (event) => {
+      // 先打点再解析：畸形帧同样证明「对端在推东西」，不该被误判成空闲。
+      noteFrameReceived();
       let msg;
       try {
         if (typeof event.data !== 'string') throw new Error('binary frame');
@@ -1140,9 +1280,11 @@ export class NodeApiClient extends AbstractApiClient {
           // 这里主动重开一次订阅；仍然想订阅的会话才重开（forget 过的就让它走）。
           if (this._desiredFollows.has(sessionId)) {
             console.error(`[dsh-client] session/follow 已被服务端结束，重新订阅：${sessionId}`);
-            setTimeout(() => {
+            const resubTimer = setTimeout(() => {
               if (!ended && this._desiredFollows.has(sessionId)) sendOpen(sessionId);
             }, 2000);
+            // 纯后台重试：不该把进程钉住 2 秒（测试进程会等它，正常退出也会被拖）。
+            resubTimer?.unref?.();
           }
         }
       } else if (msg.type === 'error') {
@@ -1177,16 +1319,27 @@ export class NodeApiClient extends AbstractApiClient {
     socket.addEventListener('error', handleError, { once: true });
     sig.addEventListener('abort', handleAbort, { once: true });
     if (sig.aborted) handleAbort();
+    // 握手计时从这里开始：此刻 socket 已建、监听器已挂，之后任何 'open'/'message'
+    // 都由事件循环异步派发 —— 也就是说「50ms 内一帧都没有」是会真的走到超时的。
+    handshakeTimer = setTimeout(() => {
+      handshakeTimer = null;
+      failStream(muxTimeoutError(MUX_HANDSHAKE_TIMEOUT_CODE, `DSH 事件流握手超时（${handshakeTimeoutMs}ms）：建连后没有收到任何帧`));
+    }, handshakeTimeoutMs);
+    handshakeTimer?.unref?.();
     try {
       while (true) {
         while (inbox.length > 0) {
           const item = inbox.shift();
           if (item.kind === 'end') return;
+          // 超时/通道异常：带着原因抛给调用方，触发它的重连（而不是静默 return）。
+          if (item.kind === 'error') throw item.error;
           yield item.envelope;
         }
         await new Promise((resolve) => { wake = resolve; });
       }
     } finally {
+      handshakeTimer = clearTimer(handshakeTimer);
+      idleTimer = clearTimer(idleTimer);
       if (this._muxSendOpen === sendOpen) this._muxSendOpen = null;
       sig.removeEventListener('abort', handleAbort);
       socket.removeEventListener('open', handleOpen);

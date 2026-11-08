@@ -625,9 +625,24 @@ await test('跨会话-9：管理员身份只来自 config.ownerQQ；豁免只挂
     // 静态锚点
     const source = fs.readFileSync(path.join(root, 'src/bridge.js'), 'utf8');
     assert.ok(!/1587\d{6}|1000000001|1000000021/.test(source), '代码里不得硬编码任何具体 QQ 号（含本次取证的号码）');
-    assert.equal(count(source, /crossSessionSendCheckV2\(/g), 3,
-      'crossSessionSendCheckV2 只能出现在 3 个发送端点里（/api/send/* + send-message + send-burst）');
-    assert.equal(count(source, /logCrossSendDeniedV2\(/g), 3, '拒绝审计同样只挂在这 3 个发送端点');
+    // 2026-11-08：豁免范围从「文字 3 个端点」扩到「全部发送路径」——
+    // 用户在私聊里叫它去群里发图/发语音是正常用法，而图片/语音/表情原先各自 403。
+    // 仍然是**只读端点与拍一拍不挂**（见 test-send-cross-session.mjs 的端点清单校验）。
+    const SEND_PATH_CALLS = 7; // /api/send/{group,private,reply} + send-message + send-burst + send-image + send-sticker + send-voice + speak 里的实际调用点
+    assert.ok(count(source, /crossSessionSendCheckV2\(/g) >= SEND_PATH_CALLS,
+      `crossSessionSendCheckV2 的调用点应覆盖全部发送路径（至少 ${SEND_PATH_CALLS} 处）`);
+    assert.ok(count(source, /logCrossSendDeniedV2\(/g) >= SEND_PATH_CALLS,
+      '拒绝审计要与豁免同样只挂在发送路径上');
+    // 拍一拍必须**没有**豁免：它是对某个人的动作，跨会话代发会变成骚扰链
+    {
+      const lines = source.split('\n');
+      const start = lines.findIndex((l) => l.includes("url.pathname === '/api/socialV2/send-poke'"));
+      assert.ok(start > 0, 'send-poke 端点应存在');
+      let end = start + 1;
+      while (end < lines.length && !lines[end].includes("if (req.method === '")) end += 1;
+      assert.equal(lines.slice(start, end).join('\n').includes('crossSessionSendCheckV2'), false,
+        'send-poke 不应有跨会话豁免（拍一拍只作用本会话）');
+    }
     assert.match(source, /function ownerSessionKeyV2\(\)[\s\S]{0,200}cfg\.ownerQQ/, 'owner 身份只来自 cfg.ownerQQ');
     // 只读提示词/前端不构成强制：判定必须发生在桥接的 HTTP 层（本测试正是直接打端点，没有模型参与）
     console.log('   [证据] ownerQQ 123→456789 后同一令牌 403、复原后 200；硬编码号码=0；豁免调用点=3（仅发送端点）');

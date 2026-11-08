@@ -5,6 +5,13 @@
 // 本脚本用字节级往返证明这一点，并证明 chcp 65001 能把它救回来。
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+
+// 这两个脚本验证的是 Windows 专有机制（cmd.exe 的 goto/timeout、chcp 代码页），
+// 在 Linux/macOS 上跑只会得到 ENOENT —— 直接跳过，让门禁在任何平台都能整跑。
+if (process.platform !== 'win32') {
+  console.log(`⏭  跳过（Windows 专用）：${import.meta.url.split('/').pop()}`);
+  process.exit(0);
+}
 // 独立发语音工具在仓库上一级（不在本仓库里）：位置解析与"不在时怎么跳过"走共享口径。
 import { hasVoiceTool, skipVoiceTool, voiceToolPath } from './voice-tool-locator.mjs';
 

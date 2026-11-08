@@ -155,6 +155,11 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     await fs.mkdir(path.join(fixture, 'src'));
     await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js', 'long-wait-http.js'].map((name) =>
       fs.copyFile(path.join(ROOT, 'src', name), path.join(fixture, 'src', name))));
+    // MCP server 依赖的 core/ 模块（少一个，子进程就在 import 阶段直接退出，
+    // 报错只剩 "MCP error -32000: Connection closed"，看不出真因）
+    await fs.mkdir(path.join(fixture, 'src', 'core'), { recursive: true });
+    await Promise.all(['retry-http.mjs'].map((name) =>
+      fs.copyFile(path.join(ROOT, 'src', 'core', name), path.join(fixture, 'src', 'core', name))));
     await fs.writeFile(path.join(fixture, 'config.json'), JSON.stringify({ consolePort: api.address().port }));
     const transport = new StdioClientTransport({
       command: process.execPath,

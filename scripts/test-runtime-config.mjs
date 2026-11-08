@@ -127,6 +127,26 @@ test('默认配置：loadConfig 的全部默认值', () => {
   assert.equal(config.socialV2.sticker.syncTtlMs, 60000);
 
   assert.deepEqual(config.socialV2.voice, {
+    // 收到语音时的转写（QQ 侧语音转文字）
+    transcribe: {
+      enabled: true,
+      timeoutMs: 1500,
+      engine: 'auto',
+      local: {
+        enabled: true,
+        silkDecoder: '/opt/local-asr/bin/silk-decoder',
+        whisperBin: '/opt/local-asr/bin/whisper-cli',
+        model: '/opt/local-asr/models/ggml-base.bin',
+        libPath: '/opt/local-asr/bin',
+        language: 'zh',
+        timeoutMs: 120000
+      }
+    },
+    // TTS 参数（2026-11-08）：音色可切换 + 语速/音调/音量
+    tts: {
+      voice: 'zh-CN-XiaoxiaoNeural', python: 'python3', timeoutMs: 30000,
+      rate: '', pitch: '', volume: ''
+    },
     enabled: false,
     dir: 'audio',
     maxSeconds: 300,
@@ -240,6 +260,8 @@ test('socialV2 非对象 / null 子节与空工具表：spread 怪癖与深度�
   assert.equal(parse({ socialV2: { tools: false } }).config.socialV2.tools.getPrompt, true);
   assert.equal(parse({ socialV2: { tools: null } }).config.socialV2.tools.slangQuery, true);
   assert.deepEqual(parse({ socialV2: { voice: null } }).config.socialV2.voice, {
+    transcribe: { enabled: true, timeoutMs: 1500, engine: 'auto', local: { enabled: true, silkDecoder: '/opt/local-asr/bin/silk-decoder', whisperBin: '/opt/local-asr/bin/whisper-cli', model: '/opt/local-asr/models/ggml-base.bin', libPath: '/opt/local-asr/bin', language: 'zh', timeoutMs: 120000 } },
+    tts: { voice: 'zh-CN-XiaoxiaoNeural', python: 'python3', timeoutMs: 30000, rate: '', pitch: '', volume: '' },
     enabled: false, dir: 'audio', maxSeconds: 300, maxBytes: 20 * 1024 * 1024,
     maxPerMinute: 2, maxPerHour: 10, allowAbsolutePath: false, defaultVolume: 1,
     loudness: 'normal', ffmpegPath: '', autoReadback: true

@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
 import { longWaitFetch, longWaitBudget } from './long-wait-http.js';
+import { shouldRetryRequest, networkErrorHint } from './core/retry-http.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -125,7 +126,11 @@ function readConsoleToken() {
 
 async function agentApi(path, init = {}) {
   const timeoutMs = init.timeoutMs || 15000;
-  const { timeoutMs: _omit, ...rest } = init;
+  // `admin: true` = 这是**操作者级**动作（改全局配置），不属于任何会话，因此不该声称
+  // 自己是"智能体调用"——桥接的隔离关卡要求智能体调用必须带有效会话令牌，而这类工具
+  // 根本没有会话可绑。带上它就是必然 403「未授权：智能体调用必须携带有效的会话令牌」。
+  // 去掉后走的是控制台令牌（管理端全权），语义与能力都正确。
+  const { timeoutMs: _omit, admin: _admin, ...rest } = init;
   const consoleToken = readConsoleToken();
   const headers = {
     'content-type': 'application/json',
@@ -138,9 +143,28 @@ async function agentApi(path, init = {}) {
   // 不是被拒绝，反而提权成控制台权限（confused deputy）。
   // 令牌本身仍然只在真有时才发：/api/status 的模式探测（legacyReadToolAllowed）本来就是
   // 无令牌调用，桥接对它单独放行并按最小对象返回。
-  headers['x-agent-call'] = '1';
+  if (!init.admin) headers['x-agent-call'] = '1';
   const request = path === '/api/socialV2/wait' ? longWaitFetch : fetch;
-  const res = await request(`${agentApiBase()}${path}`, { ...rest, headers, signal: AbortSignal.timeout(timeoutMs) });
+  // 只有「幂等/只读」的调用才允许在**中途断开**后重试：发送类工具重试可能导致重复发送。
+  // 连接压根没建立（ECONNREFUSED 等）则任何工具都能安全重试 —— 判定见 core/retry-http.mjs。
+  const method = String(rest.method ?? 'GET').toUpperCase();
+  const isReadOnly = method === 'GET' || path === '/api/socialV2/wait';
+  let res;
+  const callOnce = () => request(`${agentApiBase()}${path}`, { ...rest, headers, signal: AbortSignal.timeout(timeoutMs) });
+  try {
+    res = await callOnce();
+  } catch (error) {
+    if (!shouldRetryRequest({ error, isReadOnly })) {
+      const hint = networkErrorHint(error);
+      throw new Error(isReadOnly || !/中途断开|连不上/.test(hint) ? hint : `${hint}（发送类工具不会自动重试，以免重复发送）`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    try {
+      res = await callOnce();
+    } catch (retryError) {
+      throw new Error(`${networkErrorHint(retryError)}（已自动重试 1 次仍失败）`);
+    }
+  }
   let body = null;
   try { body = await res.json(); } catch { body = null; }
   if (path === '/api/socialV2/wait' && body === null) throw new Error('等待接口返回无效 JSON');
@@ -519,7 +543,7 @@ server.tool(
         question: z.boolean().optional().describe('被直接提问/点名挑战时唤醒'),
         poke: z.boolean().optional().describe('有人拍一拍时唤醒（群聊包括拍你和拍别人，私聊为对方拍你）'),
         anyMessage: z.boolean().optional().describe('任意新消息都唤醒（活跃模式）'),
-        probability: z.number().optional().describe('普通消息按该概率随机唤醒（0~1）')
+        probability: z.number().optional().describe('普通消息按该概率随机唤醒（0~1）。注意这是**基准值**：桥接还会按北京时间乘一个时段系数（睡觉时段 0~8 点 ×0.2、DeepSeek 波峰时段 ×0.5），所以实际概率可能低于你填的数值。不要为了"更积极"而手动调高基准——那会把时段设计整个抬平；工具返回的 wakeTimeScale.probabilityEffective 就是当前实际生效值。推荐 0.05，一般不超过 0.2')
       }).optional(),
       batchWindowMs: z.number().optional().describe('多条消息合并唤醒窗口（毫秒，>=1000）')
     }).describe('要设置的唤醒配置，缺省字段保留原值')
@@ -1021,17 +1045,19 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
 if (cfg.socialV2?.tools?.sendImage !== false) {
   server.tool(
     'qq_send_image',
-    '把一张图片发到指定会话（群聊或私聊）。url **必须是白名单图床的图片地址**（目前只允许贴吧图床：*.baidu.com / *.bdstatic.com / *.bdimg.com / *.bcebos.com；qq_tieba_read 的返回文本里会逐张列出可用地址，格式是「- 图N: <url>」）。桥接会自己下载后按 OneBot 的 image 段发出，所以：① 其它地址（example.com 之类的普通网址、本机/内网地址、data:/base64: 串）一律被拒绝，不要反复重试；② 单张 ≤4MiB，超限**如实失败**（不会截断成半张图）；③ 下载失败 / 非白名单主机 / 超过体积 / 发送失败都会把**原因如实**告诉你，不要把这些失败说成"已经发出去了"；④ 发送计入该会话的发送频率上限（maxSendPerMinute / maxSendPerHour），被限流会明确报错，不会静默放行。',
+    '把一张图片发到指定会话（群聊或私聊）。两条来源二选一：**外链图**用 url（必须是白名单图床地址）（目前只允许贴吧图床：*.baidu.com / *.bdstatic.com / *.bdimg.com / *.bcebos.com；qq_tieba_read 的返回文本里会逐张列出可用地址，格式是「- 图N: <url>」）。桥接会自己下载后按 OneBot 的 image 段发出，所以：① 其它地址（example.com 之类的普通网址、本机/内网地址、data:/base64: 串）一律被拒绝，不要反复重试；② 单张 ≤4MiB，超限**如实失败**（不会截断成半张图）；③ 下载失败 / 非白名单主机 / 超过体积 / 发送失败都会把**原因如实**告诉你，不要把这些失败说成"已经发出去了"；④ 发送计入该会话的发送频率上限（maxSendPerMinute / maxSendPerHour），被限流会明确报错，不会静默放行。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      url: z.string().describe('白名单图床的图片地址（贴吧图床 *.baidu.com / *.bdstatic.com / *.bdimg.com / *.bcebos.com 下的 http(s) 图片；来自 qq_tieba_read 文本里的「- 图N: <url>」）')
+      url: z.string().optional().describe('白名单图床的图片地址（贴吧图床 *.baidu.com / *.bdstatic.com / *.bdimg.com / *.bcebos.com 下的 http(s) 图片）。与 file 二选一'),
+      file: z.string().optional().describe('**本地图库**里的相对路径（表情包走这条）。值就是 send_meme / meme_list 返回的 path 里的图库相对部分，例如 dafeiyu-001/memes/happy/xiao.jpg。与 url 二选一')
     },
-    async ({ key, token, url }) => {
+    async ({ key, token, url, file }) => {
       try {
+        if (!url && !file) throw new Error('url 与 file 至少给一个：外链图用 url，表情包用 file');
         const data = await agentApi('/api/socialV2/send-image', {
           method: 'POST',
-          body: JSON.stringify({ key, url: String(url), token }),
+          body: JSON.stringify({ key, url: url ? String(url) : undefined, file: file ? String(file) : undefined, token }),
           headers: { 'x-agent-token': token },
           // 下载最多 4MiB + 一次发送，给 120 秒（与 send-sticker 同一量级，但不必给到 300 秒）。
           timeoutMs: 120000
@@ -1071,6 +1097,74 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
 }
 
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
+  server.tool(
+    'qq_list_tts_voices',
+    '列出可用的语音音色（edge-tts）+ 当前默认音色/语速/音调。想在 qq_send_speech 里换嗓说一句之前，先用它看看有哪些可选。',
+    {},
+    async () => {
+      try {
+        // 全局只读，不绑定任何会话 → 走管理端通道（否则缺 x-agent-token 头会被 403）
+        const data = await agentApi('/api/socialV2/tts-voices', { admin: true });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查询音色失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_set_tts_voice',
+    '切换**默认**语音音色（影响之后所有 qq_send_speech 的嗓音，运行时生效，不用重启）。注意：① 这是全局设置，改了整个机器人都会换嗓；② 只想改一句就用 qq_send_speech 的 voice 参数，不要动这里；③ voice 传列表里的 id；rate/volume 是百分比（如 +10%），pitch 是 Hz（如 +5Hz）。',
+    {
+      voice: z.string().optional().describe('音色 id，如 zh-CN-YunxiNeural（男）/ zh-CN-XiaoyiNeural（女）'),
+      rate: z.string().optional().describe('语速，百分比：+10% 更快、-10% 更慢；传空串恢复默认'),
+      pitch: z.string().optional().describe('音调，Hz：+5Hz 更高、-5Hz 更低；传空串恢复默认'),
+      volume: z.string().optional().describe('音量，百分比：+0% 即原样；传空串恢复默认')
+    },
+    async ({ voice, rate, pitch, volume }) => {
+      try {
+        const data = await agentApi('/api/socialV2/tts-voice', {
+          method: 'POST',
+          admin: true, // 全局配置，不是会话内动作
+          body: JSON.stringify({ voice, rate, pitch, volume })
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `切换音色失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  // 「把这句话说出声」：文字 → edge-tts → QQ 语音条。与 qq_send_voice（点播语音库文件）
+  // 的区别是**内容由你自己决定**，不需要谁事先准备音频。
+  server.tool(
+    'qq_send_speech',
+    '把一段文字合成语音并发到指定会话（现合成现发，不需要预先准备音频文件）。适合：想用声音说一句话、道歉、说晚安、表达情绪。注意：① 文字上限 200 字，太长会拒绝；② 合成需要 3~10 秒，期间调用会一直等到发完；③ 语音是强表达，比文字更打扰，别滥用（频率上限与其他语音共用）；④ 返回 verified=true 才能对用户说"我说话了"；⑤ 合成失败会如实报错（通常是宿主机没装 edge-tts），不要假设已发出。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      text: z.string().describe('要说的话（≤200 字，会被念出来）'),
+      voice: z.string().optional().describe('音色，默认 zh-CN-XiaoxiaoNeural（晓晓·女声）；可选 zh-CN-YunxiNeural（云希·男声）、zh-CN-XiaoyiNeural（晓伊·女声）等'),
+      verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true）')
+    },
+    async ({ key, token, text, voice, verify }) => {
+      try {
+        const data = await agentApi('/api/socialV2/speak', {
+          method: 'POST',
+          timeoutMs: 90_000, // TTS 合成 + 发送排队；默认 15s 会误判成失败
+          // 桥接的集中关卡只认 **请求头** 里的会话令牌（body 里的 token 只给端点自己用）。
+          // 漏了这个头就是 403「未授权：智能体调用必须携带有效的会话令牌」—— 其它每个
+          // v2 工具都带，新加工具时容易忘。
+          headers: { 'x-agent-token': token },
+          body: JSON.stringify({ key, token, text, voice, verify })
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `说话失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
   server.tool(
     'qq_send_voice',
     '在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。',

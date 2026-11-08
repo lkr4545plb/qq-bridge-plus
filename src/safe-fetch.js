@@ -134,7 +134,13 @@ export async function resolveSafeHost(hostname) {
   return addresses[0].address;
 }
 
-export async function validateFetchUrl(raw) {
+/**
+ * 只做「URL 语法 + 协议 + 凭据」校验，**不解析 DNS**。
+ *
+ * 拆出来是为了让域名白名单能先于 DNS 生效：被白名单拒掉的主机不该再触发一次解析
+ * （既省一次网络往返，也不把被拒主机名送进解析器），同时让白名单逻辑可以离线测。
+ */
+export function parseFetchUrl(raw) {
   let url;
   try {
     url = new URL(String(raw ?? '').trim());
@@ -143,6 +149,53 @@ export async function validateFetchUrl(raw) {
   }
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('仅允许 http/https');
   if (url.username || url.password) throw new Error('URL 不能包含凭据');
+  return url;
+}
+
+export async function validateFetchUrl(raw) {
+  const url = parseFetchUrl(raw);
+  const ip = await resolveSafeHost(url.hostname);
+  return { url, ip };
+}
+
+/**
+ * 只校验「这个 URL 是否被 allowHost 放行」，不解析 DNS、不发请求。
+ *
+ * 导出它是为了让调用方/测试能单独验证白名单判定（首跳与重定向跳走的是同一个 `assertAllowedHost`）。
+ * 返回规范化后的 URL 字符串，被拒时抛错（错误里带主机名）。
+ */
+export function checkUrlAllowed(raw, allowHost) {
+  const url = parseFetchUrl(raw);
+  assertAllowedHost(url, allowHost);
+  return url.toString();
+}
+
+/**
+ * 逐跳域名白名单（默认关闭）。
+ *
+ * 为什么需要：`validateFetchUrl` 只保证「不是内网/本机」，**不限制它是谁**。贴吧图床的 URL 一旦
+ * 被 302 到任意公网主机，字节照样会被下载下来（`buildTiebaImageContent` 之前只在入口过滤
+ * `^https?://`，没有做域名白名单）。调用方传 `allowHost` 后，**每一跳**（含重定向后的目标）都要
+ * 过一遍，被拒时抛错并写清主机名。
+ *
+ * `allowHost` 缺省为 null/undefined ⇒ 完全不启用，既有调用方的行为逐字节不变。
+ */
+function assertAllowedHost(url, allowHost) {
+  if (allowHost === undefined || allowHost === null) return;
+  if (typeof allowHost !== 'function') throw new Error('allowHost 必须是函数');
+  let allowed = false;
+  try {
+    allowed = allowHost(url.hostname) === true;
+  } catch (error) {
+    throw new Error(`allowHost 校验异常（${url.hostname}）：${error?.message ?? error}`);
+  }
+  if (!allowed) throw new Error(`主机不在允许范围内，已阻止：${url.hostname}`);
+}
+
+/** 首跳/每一跳的统一入口：语法校验 → **域名白名单** → DNS 解析 → 内网拦截。 */
+async function resolveTarget(raw, allowHost) {
+  const url = parseFetchUrl(raw);
+  assertAllowedHost(url, allowHost);
   const ip = await resolveSafeHost(url.hostname);
   return { url, ip };
 }
@@ -287,6 +340,9 @@ function requestOnce(url, ip, limit, binary = false, extraHeaders = null) {
 /**
  * 读取一个 URL 并返回正文。
  *
+ * `opts.allowHost`（可选，`(hostname) => boolean`）是**逐跳域名白名单**：不传时行为与以前完全一致；
+ * 传了则首跳与每一次重定向都要通过，否则抛错并写明被拒主机（见 assertAllowedHost）。
+ *
  * `opts.headers`（可选）是**追加/覆盖**请求头的最小口子：不传时请求头、超时、重定向与地址防护
  * 与以前**逐字节一致**；传了也仍然遵守原有防护——每一跳（含重定向后的最终目标）都重新
  * `validateFetchUrl`，`host` 由 URL 决定不接受覆盖，且跨源重定向会**丢掉**追加头（否则调用方给的
@@ -296,14 +352,14 @@ export async function safeFetch(urlString, maxChars = 50000, opts = {}) {
   validateLimit(maxChars, 'maxChars');
   const MAX_REDIRECTS = 5;
   let extraHeaders = normalizeHeaderOverrides(opts?.headers);
-  let { url, ip } = await validateFetchUrl(urlString);
+  let { url, ip } = await resolveTarget(urlString, opts?.allowHost);
   const origin = url.origin;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const result = await requestOnce(url, ip, maxChars, false, extraHeaders);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, ip } = await validateFetchUrl(next));
+      ({ url, ip } = await resolveTarget(next, opts?.allowHost));
       if (url.origin !== origin) extraHeaders = null;
       continue;
     }
@@ -331,6 +387,8 @@ export function looksLikeImageBuffer(buf) {
 /**
  * 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。
  *
+ * `opts.allowHost`（可选）与 `safeFetch` 相同：逐跳校验域名白名单，被拒时抛错并写明主机名。
+ *
  * `opts.headers`（可选）与 `safeFetch` 走**同一套**规范化与边界（`normalizeHeaderOverrides`）：
  *   · 不传 ⇒ 请求头、超时、重定向、逐跳地址校验与以前**逐字节一致**（`binary` 形态的默认头集合
  *     也一个键都没动）；
@@ -345,14 +403,14 @@ export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024, opt
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let extraHeaders = normalizeHeaderOverrides(opts?.headers);
-  let { url, ip } = await validateFetchUrl(urlString);
+  let { url, ip } = await resolveTarget(urlString, opts?.allowHost);
   const origin = url.origin;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const result = await requestOnce(url, ip, maxBytes, true, extraHeaders);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, ip } = await validateFetchUrl(next));
+      ({ url, ip } = await resolveTarget(next, opts?.allowHost));
       if (url.origin !== origin) extraHeaders = null;
       continue;
     }

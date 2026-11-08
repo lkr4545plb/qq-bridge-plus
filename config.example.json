@@ -7,7 +7,9 @@
     "authToken": "",
     "authHeader": "authorization",
     "authPrefix": "Bearer",
-    "allowRemote": false
+    "allowRemote": false,
+    "muxIdleTimeoutMs": 0,
+    "muxHandshakeTimeoutMs": 10000
   },
   "role": {
     "maxInjectChars": 10000
@@ -179,7 +181,11 @@
       "maxWakePerMinute": 1,
       "maxWakePerHour": 12,
       "noActionLimit": 3,
-      "maxWakeConfigReminders": 2
+      "maxWakeConfigReminders": 2,
+      "promptDedupe": {
+        "enabled": true,
+        "repeatEvery": 4
+      }
     },
     "send": {
       "burstEnabled": true,
@@ -230,6 +236,19 @@
       "ffmpegPath": "",
       "autoReadback": true
     },
+    "wakeTimeScale": {
+      "enabled": true,
+      "sleep": {
+        "enabled": true,
+        "startHour": 0,
+        "endHour": 8,
+        "scale": 0.2
+      },
+      "dsPeak": {
+        "enabled": true,
+        "scale": 0.5
+      }
+    },
     "proactive": {
       "enabled": true,
       "activeHours": {
@@ -244,6 +263,16 @@
     "feedback": {
       "maxLength": 500,
       "notifyOwnerOnError": false
+    },
+    "state": {
+      "saveDebounceMs": 400
+    },
+    "memory": {
+      "maxInjectChars": 1800,
+      "traitsRenderMax": 4,
+      "snapshotEnabled": true,
+      "snapshotKeepDays": 30,
+      "impressionRenderUid": true
     },
     "context": {
       "recentLimit": 100,

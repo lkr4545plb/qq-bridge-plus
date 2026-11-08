@@ -2187,6 +2187,18 @@ button:active:not(:disabled) {
         <label style="flex:1">安静阈值（分）</label><input type="number" id="v2ProactiveIdleThreshold" min="1" style="width:80px">
         <label style="flex:1">触发概率</label><input type="number" id="v2ProactiveProbability" step="0.05" min="0" max="1" style="width:80px">
       </div>
+      <div class="row">
+        <label style="flex:1">按时段降低概率</label><input type="checkbox" id="v2WakeScaleEnabled" style="width:auto">
+        <label style="flex:1">睡觉时段</label>
+        <input type="number" id="v2WakeSleepStart" min="0" max="23" style="width:64px"> ~
+        <input type="number" id="v2WakeSleepEnd" min="0" max="23" style="width:64px"> 点 ×
+        <input type="number" id="v2WakeSleepScale" step="0.05" min="0" max="1" style="width:70px">
+      </div>
+      <div class="row">
+        <label style="flex:1">DS 波峰时段 ×</label>
+        <input type="number" id="v2WakePeakScale" step="0.05" min="0" max="1" style="width:70px">
+        <span class="meta">时段只作用于「主动机会 / 概率唤醒」；@、叫名字、关键词、提问、拍一拍、指定成员、私聊等显式触发一律不打折。与上面的「安静阈值」是两层：先看主动机会是否启用，再按小时打折。</span>
+      </div>
 
       </div></details>
 <details class="settings-group"><summary>表情包参数（sticker：QQ 收藏表情体系）</summary><div class="settings-content">
@@ -2247,6 +2259,11 @@ button:active:not(:disabled) {
         <button id="v2MemoryLoad" class="small">加载记忆</button>
         <button id="v2MemoryClearAll" class="small danger">清空全部</button>
         <span class="meta" id="v2MemoryMsg"></span>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label class="meta">注入预算 <input type="number" id="v2MemoryMaxInjectChars" min="400" max="8000" step="100" style="width:88px"> 字</label>
+        <label class="meta">每人 traits 展示 <input type="number" id="v2MemoryTraitsRenderMax" min="0" max="10" step="1" style="width:64px"> 条</label>
+        <span class="meta">存储上限不变，这里只控制每轮提示里塞多少；省下的内容仍可用 qq_memory_query 查到。</span>
       </div>
       <div id="v2MemoryOutput" class="tool-log-table">（空）</div>
 
@@ -3267,6 +3284,9 @@ async function loadV2Config() {
     document.querySelectorAll('[data-v2-tool]').forEach(el => {
       el.checked = (c.tools && c.tools[el.dataset.v2Tool] !== false);
     });
+    const mem = c.memory || {};
+    document.getElementById('v2MemoryMaxInjectChars').value = Number(mem.maxInjectChars) || 1800;
+    document.getElementById('v2MemoryTraitsRenderMax').value = Number.isFinite(Number(mem.traitsRenderMax)) ? Number(mem.traitsRenderMax) : 4;
     const w = c.wake || {};
     document.getElementById('v2WakeDefaultMode').value = w.defaultMode === 'active' ? 'active' : 'diving';
     document.getElementById('v2RecDefaultInfinite').checked = w.recommendedDefaultInfinite !== false;
@@ -3316,6 +3336,13 @@ async function loadV2Config() {
     document.getElementById('v2ProactiveIntervalMax').value = Math.round((pa.checkIntervalMaxMs || 5400000) / 60000);
     document.getElementById('v2ProactiveIdleThreshold').value = Math.round((pa.idleThresholdMs || 900000) / 60000);
     document.getElementById('v2ProactiveProbability').value = pa.probability ?? 0.3;
+    const wts = c.wakeTimeScale || {};
+    const wsl = wts.sleep || {};
+    document.getElementById('v2WakeScaleEnabled').checked = wts.enabled !== false;
+    document.getElementById('v2WakeSleepStart').value = Number.isFinite(Number(wsl.startHour)) ? Number(wsl.startHour) : 0;
+    document.getElementById('v2WakeSleepEnd').value = Number.isFinite(Number(wsl.endHour)) ? Number(wsl.endHour) : 8;
+    document.getElementById('v2WakeSleepScale').value = Number.isFinite(Number(wsl.scale)) ? Number(wsl.scale) : 0.2;
+    document.getElementById('v2WakePeakScale').value = Number.isFinite(Number(wts.dsPeak?.scale)) ? Number(wts.dsPeak.scale) : 0.5;
     const stk = c.sticker || {};
     document.getElementById('v2StickerEnabled').checked = stk.enabled !== false;
     document.getElementById('v2StickerSyncTtlSec').value = Math.round((stk.syncTtlMs || 60000) / 1000);
@@ -3391,6 +3418,19 @@ async function saveV2Config() {
       defaultQuietMs: Number.isFinite(Number(document.getElementById('v2WaitDefaultQuietMs').value)) ? Math.max(0, Math.round(Number(document.getElementById('v2WaitDefaultQuietMs').value))) : 8000,
       minQuietAfterNewMs: Number.isFinite(Number(document.getElementById('v2MinQuietAfterNewMs').value)) ? Math.max(0, Math.round(Number(document.getElementById('v2MinQuietAfterNewMs').value))) : 10000
     },
+    wakeTimeScale: {
+      enabled: document.getElementById('v2WakeScaleEnabled').checked,
+      sleep: {
+        enabled: document.getElementById('v2WakeScaleEnabled').checked,
+        startHour: Math.min(23, Math.max(0, Math.round(Number(document.getElementById('v2WakeSleepStart').value) || 0))),
+        endHour: Math.min(23, Math.max(0, Math.round(Number(document.getElementById('v2WakeSleepEnd').value) || 0))),
+        scale: Math.min(1, Math.max(0, Number(document.getElementById('v2WakeSleepScale').value) || 0))
+      },
+      dsPeak: {
+        enabled: document.getElementById('v2WakeScaleEnabled').checked,
+        scale: Math.min(1, Math.max(0, Number(document.getElementById('v2WakePeakScale').value) || 0))
+      }
+    },
     proactive: {
       enabled: document.getElementById('v2ProactiveEnabled').checked,
       checkIntervalMinMs: Math.round(Number(document.getElementById('v2ProactiveIntervalMin').value) || 30) * 60000,
@@ -3415,6 +3455,10 @@ async function saveV2Config() {
       recentLimit: Math.round(Number(document.getElementById('v2ContextRecentLimit').value) || 100),
       unreadLimit: Math.round(Number(document.getElementById('v2ContextUnreadLimit').value) || 30),
       contextWindow: Math.round(Number(document.getElementById('v2ContextWindow').value) || 20)
+    },
+    memory: {
+      maxInjectChars: Math.min(8000, Math.max(400, Math.round(Number(document.getElementById('v2MemoryMaxInjectChars').value) || 1800))),
+      traitsRenderMax: Math.min(10, Math.max(0, Math.round(Number(document.getElementById('v2MemoryTraitsRenderMax').value) || 0)))
     },
     feedback: {
       maxLength: Math.round(Number(document.getElementById('v2FeedbackMaxLength').value) || 500),

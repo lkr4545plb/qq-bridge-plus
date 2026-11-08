@@ -16,6 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as memoryText from '../src/core/memory-text.mjs';
+import { clipTraits, normalizeMemoryInjectConfig, planMemoryInject } from '../src/core/memory-budget.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BRIDGE = path.join(ROOT, 'src', 'bridge.js');
@@ -86,6 +87,7 @@ function loadPatch({ cfg = {}, conversations = new Map(), sharedMemory = null, s
   const factory = new Function(
     'cfg', 'socialV2', 'log', 'redactKnownTokensOnly', 'truncateText', 'saveSocialV2State',
     'fs', 'path', 'STATE_DIR', 'atomicWriteJson', 'readJsonSafe', 'memoryText',
+    'normalizeMemoryInjectConfig', 'planMemoryInject', 'clipTraits',
     `${MEMORY_TEXT_INJECTION}
 ${block}
  return { sanitizeSharedTextV2, markSharedInjectionV2, recordSharedSourceV2, memorySourceNoteV2, sharedSourceLabelV2, isUnsafeMemoryKeyV2, isQqUidV2, sessionMemberMapV2, sessionMemberUidsV2, sessionMemberNameV2, resolveImpressionTargetV2, sharedTargetAllowedV2, confirmSharedTargetV2, impressionDisplayNameV2, stripInternalImpressionFieldsV2, stripInternalTopicFieldsV2, decaySharedImpressionsV2, clampSharedMemoryV2, clampSessionMemoryV2, migrateSharedMemoryV2, rekeyImpressionsToUidV2, sharedMemoryV2, mergeMemoryViewV2, formatMemoryV2, appendMemoryV2, sharedMemoryConfigV2, sharedDomainAllowsV2, buildMemorySnapshotV2, memorySnapshotConfigV2, listMemorySnapshotsV2 };`
@@ -97,7 +99,8 @@ ${block}
     (t) => String(t ?? ''),
     (s, n) => String(s ?? '').slice(0, n),
     () => saves.push(Date.now()),
-    fs, path, scratch, atomicStub, readStub, memoryText
+    fs, path, scratch, atomicStub, readStub, memoryText,
+    normalizeMemoryInjectConfig, planMemoryInject, clipTraits
   );
   scratchDirs.push(scratch);
   return { api, socialV2, logs, saves, scratch };

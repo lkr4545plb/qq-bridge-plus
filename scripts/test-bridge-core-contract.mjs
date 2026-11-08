@@ -14,11 +14,11 @@ test('production bridge core and console imports resolve through the native ESM 
     './console/role-routes.mjs',
     './core/console-input.mjs', './core/dsh-connection-watch.mjs', './core/group-wait-policy.mjs',
     './core/group-wake-batch.mjs', './core/image-format.mjs', './core/json-store.mjs',
-    './core/memory-text.mjs', './core/model-policy.mjs', './core/persona-text.mjs',
+    './core/memory-budget.mjs', './core/memory-text.mjs', './core/model-policy.mjs', './core/persona-text.mjs',
     './core/qq-text.mjs', './core/reply-timing.mjs', './core/role-store.mjs',
     './core/runtime-config.mjs', './core/runtime-records.mjs', './core/send-gaps.mjs',
-    './core/session-store.mjs', './core/tool-log-format.mjs', './core/wake-policy.mjs',
-    './core/wake-timers.mjs', './core/watchdog-policy.mjs',
+    './core/session-store.mjs', './core/tool-log-format.mjs', './core/tts-voices.mjs', './core/wake-policy.mjs',
+    './core/wake-time-scale.mjs', './core/wake-timers.mjs', './core/watchdog-policy.mjs',
   ]);
   const declarations = imports.map(([, names, specifier]) =>
     `import {${names}} from ${JSON.stringify(new URL(specifier, bridgeUrl).href)};`).join('\n');

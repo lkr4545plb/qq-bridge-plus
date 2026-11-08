@@ -28,7 +28,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { icacls, hasInheritedPermissionAce } from '../src/state-acl.mjs';
+import { icacls, classifyIcaclsOutput, hasInheritedPermissionAce } from '../src/state-acl.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const STRICT = process.argv.includes('--strict');
@@ -45,9 +45,17 @@ if (process.platform !== 'win32') {
 /** 路径是否被切断了继承（= 拿不到工作区根上那条可继承的能力 SID ACE）。 */
 function aclOf(target) {
   const res = icacls([target], 10000);
-  if (res.error) return { error: res.error };
-  if (res.status !== 0) return { error: new Error(`icacls 退出码 ${res.status}`) };
-  return { out: res.stdout ?? '' };
+  // 用统一分类器（与 harden 同一份判定）：
+  // `icacls /C` 失败时退出码仍是 0，只认退出码会把「拒绝访问」当成「读到了 ACL」，
+  // 随后 !hasInheritedPermissionAce 为真 ⇒ 把这条路径误报成"被切断继承"。
+  const cls = classifyIcaclsOutput(res);
+  if (!cls.ok) {
+    // 保留原始 Error（sandbox 场景要靠它的 .code === 'EPERM' 判定），
+    // 否则退化成一个带人话 detail 的普通 Error。
+    const error = res.error instanceof Error ? res.error : new Error(cls.detail);
+    return { error, detail: cls.detail };
+  }
+  return { out: `${res.stdout ?? ''}${res.stderr ?? ''}` };
 }
 
 function isSevered(target) {

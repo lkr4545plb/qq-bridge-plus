@@ -37,6 +37,42 @@ import {
   totalTokensOf
 } from './model-prices.js';
 
+/**
+ * 逐轮明细的上限与压缩比例。
+ *
+ * 为什么要有 `COMPACT_KEEP_RATIO`：淘汰必须**成批**做。旧实现一次只淘汰"超出 1 条"，
+ * 于是账本一跑满就变成"每条事件淘汰 1 条 + 整文件重写一次"—— 200 条事件 = 200 次
+ * writeFileSync、每次 3.8 MB、累计序列化 190 MB，全压在 QQ 事件路径上。
+ * 一次淘汰到 90% 之后，接下来约 10% 的流入量才需要再淘汰一次。
+ */
+export const TOKEN_LEDGER_MAX_LINES_DEFAULT = 20000;
+export const TOKEN_LEDGER_MAX_LINES_MIN = 1;
+export const TOKEN_LEDGER_MAX_LINES_MAX = 100000;
+/** 一次淘汰后保留的比例（相对 maxLines）。 */
+export const TOKEN_LEDGER_COMPACT_KEEP_RATIO = 0.9;
+/** 落盘行数超过 maxLines × 该比例时才考虑重写。 */
+export const TOKEN_LEDGER_COMPACT_HIGH_WATER_RATIO = 1.1;
+/**
+ * 高水位之上的"死区"：即使结构性开销（baselines + evicted）本身就把 journalLines 顶到
+ * 高水位以上，也要等**自上次重写以来又涨了这么多行**才重写，否则会退化成每次写都重写。
+ */
+export const TOKEN_LEDGER_COMPACT_DEAD_BAND_RATIO = 0.05;
+
+/**
+ * 归一化 `maxLines`：只接受 1..1e5 的整数。
+ *
+ * 两个必须挡住的病态值：`Infinity` 会让淘汰永不发生（文件无界增长）；`NaN` 会让
+ * `samples.size - NaN` 恒为 NaN，于是"压缩但不淘汰"，内存照样涨。
+ */
+export function normalizeTokenLedgerMaxLines(value) {
+  // 布尔要先挡掉：`Number(true) === 1` 会被当成合法的"上限 1 条"，那是误配不是意图。
+  if (typeof value === 'boolean') return TOKEN_LEDGER_MAX_LINES_DEFAULT;
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return TOKEN_LEDGER_MAX_LINES_DEFAULT;
+  if (n < TOKEN_LEDGER_MAX_LINES_MIN || n > TOKEN_LEDGER_MAX_LINES_MAX) return TOKEN_LEDGER_MAX_LINES_DEFAULT;
+  return n;
+}
+
 /** 采样键：同一回合同一步骤同一次重试只保留一条（后到覆盖先到）。 */
 function sampleKeyOf(sessionId, turn, step, retry) {
   return `${sessionId}|${turn}|${step}|${retry}`;
@@ -104,10 +140,14 @@ export function createTokenLedger({
   log = () => {},
   priceTable = DEFAULT_PRICE_TABLE,
   resolveKey,
-  maxLines = 20000,
+  maxLines: rawMaxLines = TOKEN_LEDGER_MAX_LINES_DEFAULT,
   now = () => Date.now()
 } = {}) {
   if (typeof file !== 'string' || !file) throw new Error('createTokenLedger: file is required');
+  const maxLines = normalizeTokenLedgerMaxLines(rawMaxLines);
+  const journalHighWater = Math.floor(maxLines * TOKEN_LEDGER_COMPACT_HIGH_WATER_RATIO);
+  const journalDeadBand = Math.max(1, Math.floor(maxLines * TOKEN_LEDGER_COMPACT_DEAD_BAND_RATIO));
+  const evictKeepTarget = Math.max(1, Math.min(maxLines, Math.floor(maxLines * TOKEN_LEDGER_COMPACT_KEEP_RATIO)));
 
   /** sessionId -> 最新一条投影基线 */
   const baselines = new Map();
@@ -124,6 +164,8 @@ export function createTokenLedger({
   const sessionSeen = new Map();
   /** 落盘行数（含被覆盖的旧采样），用于决定何时压缩 */
   let journalLines = 0;
+  /** 上一次重写后**真实写入**的行数：用来判断"自那以后又涨了多少"，见 journalNeedsRewrite() */
+  let lastCompactJournalLines = 0;
   let lastIngestAt = 0;
   let lastCompactedAt = 0;
   let droppedLines = 0;
@@ -251,6 +293,8 @@ export function createTokenLedger({
         log('token 账本：丢弃无法应用的行', error?.message ?? error);
       }
     }
+    // 载入后的文件就是下一次重写的参照点：之后只按"又涨了多少"判断是否值得再重写。
+    lastCompactJournalLines = journalLines;
   }
 
   // ── 落盘 ────────────────────────────────────────────────────────────────
@@ -291,16 +335,23 @@ export function createTokenLedger({
         estimated: e.estimated, dropped: e.dropped
       });
     }
+    const tmp = `${file}.${process.pid}.${Math.random().toString(16).slice(2, 10)}.tmp`;
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      const tmp = `${file}.${process.pid}.${Math.random().toString(16).slice(2, 10)}.tmp`;
       fs.writeFileSync(tmp, out.map((r) => `${JSON.stringify(r)}\n`).join(''), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, file);
       journalLines = out.length;
+      lastCompactJournalLines = journalLines;
       evictedDirty = false;
       lastCompactedAt = now();
       return true;
     } catch (error) {
+      // 失败必须清掉临时文件（saveSlang / saveStickerStore 都这么做，这里一直漏着），
+      // 否则一次写失败会在 state/ 里留下一个永远没人认领的 .tmp。
+      try { fs.unlinkSync(tmp); } catch { /* 临时文件可能压根没建出来 */ }
+      // **不要**在这里改 evictedDirty：淘汰结果还没落盘，它必须保持脏，下一次 ingest 才会重试；
+      // 反过来若本次是被"行数过高"触发的、evictedDirty 本就是 false，journalLines 也仍然偏高，
+      // 下一次 ingest 同样会再试。两种触发条件都能自然重试，无需在此额外置位。
       log('token 账本：压缩失败', error?.message ?? error);
       return false;
     }
@@ -318,7 +369,9 @@ export function createTokenLedger({
    * 把它归进「未逐轮归属」。这样即使某个会话还没有投影基线，总量也依然精确。
    */
   function evictOldestSamples() {
-    const overflow = samples.size - maxLines;
+    // 成批淘汰到 `evictKeepTarget`（默认 maxLines × 0.9）。少淘汰一条就意味着下一条事件
+    // 又要重排 + 重写整份日志，实测那是 21ms/条的同步 I/O。
+    const overflow = samples.size - evictKeepTarget;
     if (overflow <= 0) return 0;
     const ordered = [...samples.entries()].sort((a, b) => a[1].t - b[1].t);
     for (let i = 0; i < overflow; i += 1) {
@@ -346,11 +399,34 @@ export function createTokenLedger({
     return overflow;
   }
 
+  /**
+   * 文件的逻辑行数是否已经高到值得重写。
+   *
+   * 只看 `journalLines > highWater` 是不够的：重写后的 `journalLines` 是
+   * `baselines + samples + evicted`，会话一多，这个**结构性开销**本身就可能超过高水位。
+   * 那时若还按"超了就重写"判断，就会退化成"每条事件都重写"—— 旧 bug 正是这个形态。
+   * 所以再加一条：自上次重写以来至少又涨了一个死区（默认 maxLines 的 5%）才值得动手。
+   */
+  function journalNeedsRewrite() {
+    return journalLines > journalHighWater && (journalLines - lastCompactJournalLines) > journalDeadBand;
+  }
+
+  /**
+   * 压缩判断（每次 ingest 调用一次，必须是 O(1)，不能做排序或 I/O）。
+   *
+   * 三种触发条件，缺一不可：
+   *   ① 明细超上限 → 必须淘汰并重写；
+   *   ② 有未落盘的淘汰汇总（evictedDirty）→ 必须重写，否则重启后总额少算；
+   *   ③ 文件行数过高 → 重写回收空间（含死区判断，见 journalNeedsRewrite）。
+   * 其余情况直接返回 —— 这是"饱和后不再每条事件重写"的关键。
+   */
   function maybeCompact() {
-    if (journalLines <= maxLines && samples.size <= maxLines && !evictedDirty) return;
-    const dropped = evictOldestSamples();
+    const needsEvict = samples.size > maxLines;
+    const needsRewrite = evictedDirty || journalNeedsRewrite();
+    if (!needsEvict && !needsRewrite) return;
+    const dropped = needsEvict ? evictOldestSamples() : 0;
     if (dropped > 0) log(`token 账本：逐轮明细超过 ${maxLines} 条，已淘汰最旧的 ${dropped} 条（累计总量不受影响）`);
-    compact();
+    if (dropped > 0 || evictedDirty || needsRewrite) compact();
   }
 
   // ── 摄入 ────────────────────────────────────────────────────────────────
@@ -904,6 +980,7 @@ export function createTokenLedger({
     droppedLines = 0;
     lastCompactedAt = 0;
     journalLines = 0;
+    lastCompactJournalLines = 0;
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, '', { encoding: 'utf8', mode: 0o600 });

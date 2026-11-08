@@ -30,6 +30,13 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+// 这两个脚本验证的是 Windows 专有机制（cmd.exe 的 goto/timeout、chcp 代码页），
+// 在 Linux/macOS 上跑只会得到 ENOENT —— 直接跳过，让门禁在任何平台都能整跑。
+if (process.platform !== 'win32') {
+  console.log(`⏭  跳过（Windows 专用）：${import.meta.url.split('/').pop()}`);
+  process.exit(0);
+}
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OVERALL_TIMEOUT_MS = 50_000; // 硬超时保护（脚本必须在 60s 内结束）
 const WAIT_MIN_MS = 14_000;        // 契约：exit 2 后有界等待 15~30s（下界留 1s 容差）

@@ -91,6 +91,9 @@ docs/guides/REVIEW_OUT_OF_TEAM_2026-10-04.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+# 本地语音识别模型（whisper ggml，147MB；由 scripts 下载，不入库）
+models/
+
 # ── 备份包 / 压缩包不进仓库（2026-10-05 加固）────────────────────────────────
 # 本机全量备份包（如 D:\BigFish Clone.zip）含 config.json、state/console-token、
 # state/social-v2.json、SnowLuma 数据等敏感内容，绝不能进仓库、更不能随发布外流。

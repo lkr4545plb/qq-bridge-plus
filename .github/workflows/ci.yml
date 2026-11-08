@@ -1,0 +1,43 @@
+name: ci
+
+# 这个仓库此前**没有任何 CI**：94 项测试 + 静态检查全靠人手动跑。
+# 2026-10-24 的评审里，一个 P0（`/reset` 引用未声明变量）和一个 P1（每条失败发送都崩）
+# 都是靠人眼发现的 —— 这一层就是补这个洞。
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # postinstall 会改 node_modules（修 @snowluma 的 ESM 扩展名），所以先装依赖再单独跑，
+      # 出问题时错误信息落在自己的步骤里，而不是混在 npm ci 里。
+      - run: npm ci --ignore-scripts
+      - name: patch @snowluma dist
+        run: node scripts/patch-snowluma-sdk.mjs
+
+      - name: lint（只抓 bug 的规则集）
+        run: npm run lint
+
+      # 排除项都是"需要本机 Windows 或本机 DSH 安装"的脚本，不是跳过失败：
+      # 它们的名字写在这里，runner 会把排除清单打进日志（不静默）。
+      #   · test-preset-local-tools：需要 DSH 的 dsh-tool-* 包来核对工具名
+      #   · test-dsh-cli-resolve / test-dsh-discovery-logging：断言本机 dsh CLI 的解析结果
+      - name: 全量审计（94+ 项）
+        run: npm run test:audit
+        env:
+          QQ_BRIDGE_TEST_EXCLUDE: >-
+            test-preset-local-tools.mjs,
+            test-dsh-cli-resolve.mjs,
+            test-dsh-discovery-logging.mjs

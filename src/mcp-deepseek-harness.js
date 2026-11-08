@@ -60,6 +60,28 @@ async function call(method, payload, label) {
 const DEBUG = process.env.DSH_MCP_DEBUG === '1';
 function debug(...args) { if (DEBUG) console.error('[deepseek-harness]', ...args); }
 
+/** 普通延时（executor 不返回值，避免 `no-promise-executor-return`）。 */
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+/**
+ * 带**定时器清理**的超时竞速。
+ *
+ * 旧写法是 `Promise.race([promise, new Promise((_, reject) => setTimeout(...))])`：
+ * promise 先赢时那个 setTimeout 仍然挂着 —— 默认 120s、上限 600s，
+ * 等于把 MCP 进程的退出（以及 node:test 的收尾）拖住好几分钟。
+ * 这里在 finally 里清掉，并把 `unref()` 挂上（后台超时不该钉住事件循环）。
+ */
+function withDeadline(promise, ms, makeError) {
+  let timer = null;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => { reject(makeError()); }, ms);
+    timer?.unref?.();
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+  });
+}
+
 function openTurnWaiter(api, sessionId) {
   const collector = createTurnCollector();
   const abort = new AbortController();
@@ -75,6 +97,10 @@ function openTurnWaiter(api, sessionId) {
   let resolveEnded;
   let rejectEnded;
   const ended = new Promise((resolve, reject) => { resolveEnded = resolve; rejectEnded = reject; });
+  // 事件路径可能因为 ready 超时/取消而**无人消费** ended：先挂一个空 catch 把它标记为已处理，
+  // 否则消费协程里的 reject 会变成 unhandledRejection（Node 22 默认直接退出进程）。
+  // 注意：这只吞掉「附带的」那条分支，wait() 仍然会收到原始的拒绝。
+  ended.catch(() => {});
   (async () => {
     try {
       for await (const envelope of stream) {
@@ -101,6 +127,13 @@ function openTurnWaiter(api, sessionId) {
       }
       // 流结束（DSH 重启 / WS 断开）：不抛错，交给并行的轮询兜底。
     } catch (error) {
+      // 握手/空闲超时表示「这条流不再可用」，在本模块的语义里等价于「流结束」：
+      // 下方的 session.list 轮询兜底仍然可能拿到结果，不能因为事件路径超时就整单失败。
+      // （真正的流错误——stream/error、鉴权失败——仍然上抛。）
+      if (error?.code === 'mux/handshake-timeout' || error?.code === 'mux/idle-timeout') {
+        debug('stream unavailable, fallback to poll', error.code, String(error?.message ?? error).slice(0, 120));
+        return;
+      }
       rejectEnded(error);
     }
   })();
@@ -118,7 +151,7 @@ function openTurnWaiter(api, sessionId) {
       // 读不到就退回"只看快照里的 turn/start"，不致命。
     }
     // 留一点时间让 follow 的开场快照把历史 turn/start 收进来。
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await sleep(60);
     baselineFrozen = true;   // 从这里起，turn/start 属于本轮，不再抬 baseline
     debug('ready', { sessionId, baselineTurn, targetTurn });
     return baselineTurn;
@@ -138,7 +171,9 @@ function openTurnWaiter(api, sessionId) {
         pollTurnResult(api, sessionId, () => baselineTurn, timeoutMs, graceMs, cancelled),
       ])
         .finally(() => { settled = true; })
-        .then((result) => ({ ...result, elapsedMs: Date.now() - started }))
+        // result 为 null 只可能出现在「轮询先于事件路径结算」的防御性分支里，
+        // 正常路径一定是事件或轮询给出的对象。这里不制造假结果。
+        .then((result) => (result ? { ...result, elapsedMs: Date.now() - started } : null))
         .finally(() => abort.abort());
     },
     close() { abort.abort(); },
@@ -151,12 +186,14 @@ function openTurnWaiter(api, sessionId) {
  * 只接受 turn > baselineTurn 的项，避免把历史回合当成新结果。
  */
 async function pollTurnResult(api, sessionId, baselineTurnRef, timeoutMs, graceMs, cancelled = () => false) {
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const deadline = Date.now() + timeoutMs;
   debug('poll start', { sessionId, graceMs, timeoutMs });
   await sleep(Math.max(0, Math.min(graceMs, timeoutMs)));
   while (Date.now() < deadline) {
-    if (cancelled()) { debug('poll cancelled (结果已由事件路径拿到)'); return new Promise(() => {}); }
+    // 取消分支：**不要**返回永不 settle 的 Promise（那会把轮询协程永久挂住）。
+    // 走到这里时 Promise.race 早已由事件路径结算，返回 null 不会被当成结果
+    // （wait() 对 null 做了显式兜底），只是让这个协程干净退出。
+    if (cancelled()) { debug('poll cancelled (结果已由事件路径拿到)'); return null; }
     try {
       const listed = unwrap(await api.callUnary('session.list', {}), 'session.list');
       const item = (listed?.items ?? []).find((row) => row?.sessionId === sessionId);
@@ -257,10 +294,11 @@ server.tool(
       // 顺序很关键：先订阅并等 ready，再发 prompt（否则回合事件可能在订阅生效前就发走）。
       if (waitForResult) {
         waiter = openTurnWaiter(api, sessionId);
-        await Promise.race([
+        await withDeadline(
           waiter.ready,
-          new Promise((_, reject) => setTimeout(() => reject(new Error(`订阅会话事件流超时（${timeoutMs}ms）`)), timeoutMs)),
-        ]);
+          timeoutMs,
+          () => new Error(`订阅会话事件流超时（${timeoutMs}ms）`),
+        );
       }
       const accepted = unwrap(await api.callUnary('session.prompt', {
         sessionId,

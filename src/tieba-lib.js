@@ -309,8 +309,7 @@ function decodeEntities(s) {
     if (!Number.isInteger(n) || n <= 0 || n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)) return fallback;
     try { return String.fromCodePoint(n); } catch { return fallback; }
   };
-  return String(s ?? '')
-    .replace(/<[^>]+>/g, ' ')
+  return stripTags(String(s ?? ''))
     .replace(/&nbsp;|&ensp;|&emsp;|&thinsp;/g, ' ')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
@@ -374,6 +373,42 @@ function isSearchShellUrl(url) {
  * 「标题 `<a>` 之后、下一个 `res-title` 之前」这段自身区域里找，URL 优先取标题 `<a>` 自己属性里的
  * `data-mdurl`——否则会把块里夹着的广告/下一个容器的摘要与链接算到当前条目头上。
  */
+/**
+ * 在一个结果块里找「`<h3 class="…res-title…">` + 其后的 `<a …>标题</a>`」，线性且不回溯。
+ *
+ * 原实现是一条正则：`/<h3\b[^>]*class=["']res-title[\s\S]{0,600}?<a\b([^>]*)>([\s\S]*?)<\/a>/i`。
+ * `[^>]*` 在「一堆 `<h3` 但没有 `>`」的块上会逐位回退 —— 1MB 的畸形块实测直接把事件循环挂住。
+ * 这里改成：线性找 `<h3 …>` 开标签 → 检查类名 → 在 600 字符窗口内找 `<a>`（与原 `{0,600}` 一致）
+ * → 取到 `</a>`（上限 8KB；标题本身会被 cut 到 TITLE_MAX=120，真实标题远小于这个窗口）。
+ *
+ * @returns {{index:number, end:number, attrs:string, inner:string}|null}
+ */
+function findResTitleAnchor(block, lower, from = 0) {
+  const scanH3 = createTagScanner(block, lower, 'h3');
+  let h = scanH3.next(from);
+  while (h !== null) {
+    if (h.closing) { h = scanH3.next(h.end); continue; }
+    const tag = block.slice(h.start, h.end);
+    if (!/\bclass=["']res-title/i.test(tag)) { h = scanH3.next(h.end); continue; }
+    const windowEnd = Math.min(block.length, h.end + 600);
+    const aAt = lower.indexOf('<a', h.end);
+    const afterA = aAt >= 0 ? lower.charCodeAt(aAt + 2) : -1;
+    const aIsWord = afterA >= 0 && ((afterA >= 48 && afterA <= 57) || (afterA >= 97 && afterA <= 122) || afterA === 95);
+    if (aAt < 0 || aAt >= windowEnd || aIsWord) { h = scanH3.next(h.end); continue; }
+    const aGt = block.indexOf('>', aAt);
+    if (aGt < 0) return null;
+    const closeA = lower.indexOf('</a>', aGt);
+    if (closeA < 0 || closeA - aGt > 8000) { h = scanH3.next(h.end); continue; }
+    return {
+      index: h.start,
+      end: closeA + 4,
+      attrs: block.slice(aAt + 3, aGt),
+      inner: block.slice(aGt + 1, closeA),
+    };
+  }
+  return null;
+}
+
 export function parseSo360Results(html, { limit = SEARCH_RESULTS_MAX } = {}) {
   const out = [];
   const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : SEARCH_RESULTS_MAX;
@@ -397,8 +432,9 @@ export function parseSo360Results(html, { limit = SEARCH_RESULTS_MAX } = {}) {
       if (out.length >= max) break;
       // `<h3   class="res-title">` / `<h3 class="res-title " >` 都见过，`<a>` 前可能换行，
       // 所以匹配到 `class=["']res-title` 后允许一段任意内容再取 `<a …>标题</a>`，并顺手拿到该 `<a>` 的属性串。
-      const anchor = block.match(/<h3\b[^>]*class=["']res-title[\s\S]{0,600}?<a\b([^>]*)>([\s\S]*?)<\/a>/i);
-      const attrs = anchor ? anchor[1] : '';
+      const blockLower = block.toLowerCase();
+      const anchor = findResTitleAnchor(block, blockLower);
+      const attrs = anchor ? anchor.attrs : '';
       // 真链优先从**标题那个 `<a>` 自己**的属性里取（data-mdurl，其次实测同值的 data-cache）；
       // 拿不到才退一步在块内找第一个——但**永远不用 href 兜底**：href 是 `https://www.so.com/link?m=…`
       // 跳转壳，把它当结果 URL 就是把用户送去 so.com。
@@ -410,13 +446,13 @@ export function parseSo360Results(html, { limit = SEARCH_RESULTS_MAX } = {}) {
         '';
       const url = decodeEntities(rawUrl);
       if (!/^https?:\/\//i.test(url) || isSearchShellUrl(url) || out.some((r) => r.url === url)) continue;
-      const title = cut(decodeEntities(anchor ? anchor[2] : ''), TITLE_MAX);
+      const title = cut(decodeEntities(anchor ? anchor.inner : ''), TITLE_MAX);
       // 摘要只在**条目自己的区域**里找：区域从标题 `<a>` 结束处到「下一个 res-title 标题」之前。
       // 条目只有开标签边界（`</li>` 不能用），块尾会拖进后面夹着的广告/下一个容器，不设这条界
       // 就会把别人家的摘要当成自己的（2026-10-08 那个「类名含 res-list 子串」的夹具陷阱就是这么抓出来的）。
-      const anchorEnd = anchor ? anchor.index + anchor[0].length : 0;
-      const nextTitle = anchor ? block.slice(anchorEnd).search(/<h3\b[^>]*class=["']res-title/i) : -1;
-      const regionEnd = nextTitle >= 0 ? anchorEnd + nextTitle : block.length;
+      const anchorEnd = anchor ? anchor.end : 0;
+      const nextAnchor = anchor ? findResTitleAnchor(block, blockLower, anchorEnd) : null;
+      const regionEnd = nextAnchor ? nextAnchor.index : block.length;
       const inOwnRegion = (re) => {
         const mm = block.match(re);
         return mm && mm.index < regionEnd ? mm : null;
@@ -469,13 +505,141 @@ export function formatSearchResults(query, results, { maxChars = SEARCH_TEXT_MAX
   return joined.length <= bound ? joined : joined.slice(0, bound);
 }
 
+/**
+ * 单遍剥掉 `<script …>…</script>`（或 style）整段，语义等价于 `/<script[\s\S]*?<\/script>/gi`。
+ *
+ * 为什么不能用正则：非贪婪 `[\s\S]*?` 在**没有闭合标签**的畸形输入上是 O(n²) —— 每个
+ * `<script` 起点都要扫到文末找 `</script>`。本机实测（改前）：32KB 的 `'<script'.repeat(N)`
+ * 要 417ms、64KB 1.6s、128KB 6.8s、256KB 23s。而 `htmlToText` 是**同步跑在 bridge 事件循环上**的
+ * （贴吧页、楼层正文、搜索摘要三处都走它），一次畸形页面就能把 QQ 收发与看门狗一起卡死。
+ *
+ * 这里是严格的线性扫描：`indexOf` 往后找开/闭标签，命中后指针直接跳到闭标签之后，不回退。
+ * 找不到闭标签时**原样保留**（正则同样匹配不上），并从开标签之后继续找下一个起点，与正则的
+ * 「从左到右、非贪婪、不跨过未闭合的开标签」逐字一致。
+ */
+function stripPairedBlocks(text, openName, closeName) {
+  const src = String(text ?? '');
+  const lower = src.toLowerCase();
+  const open = String(openName).toLowerCase();
+  const close = String(closeName).toLowerCase();
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const at = lower.indexOf(open, i);
+    if (at < 0) { out += src.slice(i); break; }
+    const end = lower.indexOf(close, at + open.length);
+    if (end < 0) {
+      // `indexOf` 已经搜到**文末**了：说明后面根本不存在闭标签，那么后续任何 `<script` 起点
+      // 也不可能配对（正则同样一处都匹配不上）。剩下的原样留下并结束——这一步是线性的关键，
+      // 若像早先那样「从下一个起点继续找」，每个起点都会重扫到文末，又退回 O(n²)。
+      out += src.slice(i);
+      break;
+    }
+    out += src.slice(i, at);
+    out += ' ';
+    i = end + close.length;
+  }
+  return out;
+}
+
+/**
+ * 线性剥标签，等价于 `/<[^>]+>/g` → ' '。
+ *
+ * 为什么也要换：`[^>]+` 在"只有 `<` 没有 `>`"的畸形输入上同样是 O(n²)（每个 `<` 都扫到文末）。
+ * 1MB 的 `'<script'.repeat(N)` 走完 `stripPairedBlocks` 后仍是这个形状，实测会挂住整条事件循环。
+ *
+ * 语义对齐 `[^>]+`：`<>`（中间没有字符）**不算**标签，原样保留。
+ */
+function stripTags(text, replacement = ' ') {
+  const src = String(text ?? '');
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const lt = src.indexOf('<', i);
+    if (lt < 0) { out += src.slice(i); break; }
+    const gt = src.indexOf('>', lt + 1);
+    if (gt < 0) { out += src.slice(i); break; }      // 后面再没有 '>'：剩下的原样保留
+    if (gt === lt + 1) { out += src.slice(i, lt + 1); i = lt + 1; continue; } // `<>`：不是标签
+    out += src.slice(i, lt);
+    out += replacement;
+    i = gt + 1;
+  }
+  return out;
+}
+
+/**
+ * 建一个**有状态**的标签扫描器：`peek/next(minFrom)` 返回下一个 `<name …>` 或 `</name …>`。
+ *
+ * 为什么必须有状态：无状态版本每次都要同时 `indexOf('<div')` 和 `indexOf('</div')`，而页面上
+ * 往往只有其中一种 —— 另一种的 `indexOf` 会从当前位置一路扫到文末。放在循环里就是
+ * O(次数 × 文长)：1MB 的 `<div class="content">` 实测 8 秒。这里两个游标各自**单调前进**，
+ * 每个字节最多被扫一次。
+ *
+ * 语义对齐 `/<(\/?)div\b[^>]*>/gi`：`\b` 体现在"标签名后不能紧跟单词字符"（`<divx` 不算），
+ * 并且必须有闭合的 `>`（否则返回 null，与原正则一致）。
+ *
+ * @param {string} src   原文
+ * @param {string} lower 原文的**一次**小写副本（避免每次调用都 toLowerCase 一整页）
+ * @param {string} name  标签名（小写）
+ */
+function createTagScanner(src, lower, name) {
+  const openNeedle = `<${name}`;
+  const closeNeedle = `</${name}`;
+  let openNext = lower.indexOf(openNeedle);
+  let closeNext = lower.indexOf(closeNeedle);
+  let floor = 0;
+  let pending = null;
+  let hasPending = false;
+  const isWord = (code) => (code >= 48 && code <= 57) || (code >= 97 && code <= 122) || code === 95;
+
+  function compute() {
+    while (true) {
+      let at;
+      let closing;
+      if (openNext >= 0 && (closeNext < 0 || openNext < closeNext)) { at = openNext; closing = false; }
+      else if (closeNext >= 0) { at = closeNext; closing = true; }
+      else return null;
+      const nameEnd = at + (closing ? 2 : 1) + name.length;
+      const code = lower.charCodeAt(nameEnd);
+      if (nameEnd < lower.length && isWord(code)) {
+        // `<divx`：不是该标签，跳过这一个候选继续找（游标前移，不回退）。
+        if (closing) closeNext = lower.indexOf(closeNeedle, nameEnd);
+        else openNext = lower.indexOf(openNeedle, nameEnd);
+        continue;
+      }
+      const gt = src.indexOf('>', at);
+      if (gt < 0) return null;
+      if (closing) closeNext = lower.indexOf(closeNeedle, gt + 1);
+      else openNext = lower.indexOf(openNeedle, gt + 1);
+      return { start: at, end: gt + 1, closing };
+    }
+  }
+
+  /**
+   * `peek(minFrom)` 看下一个标签但**不消费**（多路比较时用：比较了却没选中，不能把别人的
+   * token 吃掉——早期版本就在这里丢过 URL）；`consume()` 消费掉当前 pending；
+   * `next(minFrom)` = peek + consume（单路循环用）。
+   */
+  const scan = (minFrom = 0) => {
+    if (minFrom > floor) {
+      floor = minFrom;
+      if (openNext >= 0 && openNext < floor) openNext = lower.indexOf(openNeedle, floor);
+      if (closeNext >= 0 && closeNext < floor) closeNext = lower.indexOf(closeNeedle, floor);
+      if (hasPending && pending && pending.start < floor) { hasPending = false; pending = null; }
+    }
+    if (!hasPending) { pending = compute(); hasPending = true; }
+    return pending;
+  };
+  scan.consume = () => { hasPending = false; pending = null; };
+  scan.next = (minFrom = 0) => { const tok = scan(minFrom); scan.consume(); return tok; };
+  return scan;
+}
+
 /** 去标签、反转义、压空白，得到可读纯文本。 */
 export function htmlToText(html) {
-  return String(html ?? '')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
+  // 两趟线性扫描取代原来的两条非贪婪正则（原因见 stripPairedBlocks）。
+  const withoutBlocks = stripPairedBlocks(stripPairedBlocks(html, '<script', '</script>'), '<style', '</style>');
+  return stripTags(withoutBlocks.replace(/<br\s*\/?>/gi, '\n'))
     .replace(/&nbsp;/g, ' ')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
@@ -515,6 +679,98 @@ export function parsePageTitle(html) {
   return title.replace(/[_\-—]\s*百度贴吧.*$/, '').trim();
 }
 
+/** 单个标签的最大回溯/扫描长度（真实贴吧标签 < 500 字节；超过它就不当标签）。 */
+const TL_TAG_SCAN_MAX = 8192;
+/** 单页最多检查多少个 `tl_shadow`/`tl_top` 标记：畸形页面的兜底，正常页远达不到。 */
+const TL_MARKER_MAX_CANDIDATES = 2000;
+
+/**
+ * 由 `tl_shadow`/`tl_top` 标记反推它所属的线程容器，返回 `{ start, end }`（`start` 是 `<li`
+ * 的位置，`end` 是标记之后），不成立返回 null。
+ *
+ * 为什么反向推：原正则 `/<li[^>]*class="[^"]*tl_(?:shadow|top)/i` 是**正向**的 —— 为了匹配一个
+ * 分隔符，它要从每个 `<li` 起点往后扫到 `class="`。`indexOf` 没法给"终点"设上限，于是畸形输入
+ * （`'<li a'.repeat(N)`，一个 `>` 都没有）里每个 `<li` 都要扫到文末，仍是 O(n²)。
+ *
+ * 反向只走三步、且每一步都有 8KB 上限：
+ *   ① 往前找包住标记的那对引号里的**开引号**（`"`）；
+ *   ② 要求紧邻它是 `class="`（原正则也只认双引号）；
+ *   ③ 再往前找 `<li`，中间不能出现 `>`（`[^>]*` 不跨标签）。
+ */
+function separatorForMarker(lower, markerAt, markerLen) {
+  // 往回找开引号：**必须自己扫**，不能直接用 lastIndexOf —— 畸形输入里没有引号时它会一路退到
+  // 字符串开头，2000 个候选 × 1MB = 2G 次比较（实测 2.4 秒）。这里最多退 TL_TAG_SCAN_MAX。
+  let openQuote = -1;
+  for (let k = markerAt - 1; k >= 0 && markerAt - k <= TL_TAG_SCAN_MAX; k -= 1) {
+    if (lower.charCodeAt(k) === 34 /* " */) { openQuote = k; break; }
+  }
+  if (openQuote < 0) return null;
+  // `class="` 共 7 个字符，开引号是其中最后一字符，所以起点是 openQuote - 6。
+  const classStart = openQuote - ('class="'.length - 1);
+  if (classStart < 0) return null;
+  if (lower.slice(classStart, openQuote + 1) !== 'class="') return null;
+  const floor = Math.max(0, classStart - TL_TAG_SCAN_MAX);
+  for (let k = classStart - 1; k >= floor; k -= 1) {
+    const ch = lower[k];
+    if (ch === '>') return null;                       // 跨过了标签边界
+    if (ch === '<' && lower.startsWith('<li', k)) return { start: k, end: markerAt + markerLen };
+  }
+  return null;
+}
+
+/**
+ * 按 `/<li[^>]*class="[^"]*tl_(?:shadow|top)/i` 切块并丢掉第一段，等价于原来的
+ * `split(...).slice(1)`，但整体线性且**有界**。
+ *
+ * 触发点只可能是那两种标记，所以以标记为驱动：正常页面的标记数 = 线程数（几十个），
+ * 畸形页面最多检查 TL_MARKER_MAX_CANDIDATES 个，之后放弃切分（返回已找到的部分）。
+ */
+function splitByTlChunks(html) {
+  const text = String(html ?? '');
+  const lower = text.toLowerCase();
+  const seps = [];
+  let examined = 0;
+  // 两个游标各自**单调前进**：早期写法每轮都同时 `indexOf('tl_shadow')` + `indexOf('tl_top')`，
+  // 而页面上往往只有其中一种标记 —— 另一种的 indexOf 就从当前点一路扫到文末，2000 轮 × 1MB
+  // 又变成二次（实测 1MB 2.4 秒）。缓存住"下一个位置"后，总扫描量是 O(n)。
+  let nextShadow = lower.indexOf('tl_shadow');
+  let nextTop = lower.indexOf('tl_top');
+  while (examined < TL_MARKER_MAX_CANDIDATES) {
+    let at;
+    let len;
+    if (nextShadow >= 0 && (nextTop < 0 || nextShadow <= nextTop)) {
+      at = nextShadow;
+      len = 'tl_shadow'.length;
+      nextShadow = lower.indexOf('tl_shadow', at + len);
+    } else if (nextTop >= 0) {
+      at = nextTop;
+      len = 'tl_top'.length;
+      nextTop = lower.indexOf('tl_top', at + len);
+    } else {
+      break;
+    }
+    examined += 1;
+    const sep = separatorForMarker(lower, at, len);
+    if (sep) {
+      const prev = seps[seps.length - 1];
+      if (prev && prev.start === sep.start) {
+        // 同一个标签里出现两次标记：原正则贪婪取**最后**一个，这里把 end 往后推。
+        if (sep.end > prev.end) prev.end = sep.end;
+      } else {
+        seps.push(sep);
+      }
+    }
+  }
+  const chunks = [];
+  let last = 0;
+  for (const sep of seps) {
+    chunks.push(text.slice(last, sep.start));
+    last = sep.end;
+  }
+  chunks.push(text.slice(last));
+  return chunks.slice(1);
+}
+
 /**
  * 解析移动版吧页。
  * 返回 `{ bar, followText, threadCountText, threads: [{ tid, title, author, time, replies }] }`。
@@ -526,7 +782,7 @@ export function parseBarPage(html, { maxThreads = MAX_THREADS } = {}) {
   const followText = pick(html, /关注[\s\S]{0,80}?info_value[^>]*>([\s\S]*?)<\/span>/i);
   const threadCountText = pick(html, /贴子[\s\S]{0,80}?info_value[^>]*>([\s\S]*?)<\/span>/i);
   const threads = [];
-  const chunks = String(html ?? '').split(/<li[^>]*class="[^"]*tl_(?:shadow|top)/i).slice(1);
+  const chunks = splitByTlChunks(html);
   for (const chunk of chunks) {
     if (threads.length >= maxThreads) break;
     const tid = (chunk.match(/data-tid="(\d+)"/) ?? [])[1] ?? '';
@@ -595,20 +851,26 @@ function classTokens(openTag) {
  * 抓取上限截断，所以扫不到配对时退回「第一个 `</div>`」，再不行取到扫描上界——任何情况都返回字符串。
  */
 function readDivBody(text, from, maxScan = 20000) {
-  const limit = Math.min(text.length, from + maxScan);
-  const re = /<\/?div\b[^>]*>/gi;
-  re.lastIndex = from;
+  const src = String(text ?? '');
+  const lower = src.toLowerCase();
+  const limit = Math.min(src.length, from + maxScan);
+  const scanDiv = createTagScanner(src, lower, 'div');
   let depth = 1;
-  let m;
-  while ((m = re.exec(text)) !== null && m.index < limit) {
-    if (m[0].startsWith('</')) {
+  let i = from;
+  while (i < limit) {
+    const tag = scanDiv.next(i);
+    if (!tag || tag.start >= limit) break;
+    if (tag.closing) {
       depth -= 1;
-      if (depth === 0) return text.slice(from, m.index);
+      if (depth === 0) return src.slice(from, tag.start);
     } else {
       depth += 1;
     }
+    i = tag.end;
   }
-  const seg = text.slice(from, limit);
+  // 扫不到配对（页面被截断/结构异常）时的兜底，与原实现一致：取窗口内第一个 `</div>`，
+  // 再不行就取整个窗口。
+  const seg = src.slice(from, limit);
   const naive = seg.search(/<\/div>/i);
   return naive >= 0 ? seg.slice(0, naive) : seg;
 }
@@ -630,30 +892,38 @@ function floorDataInfo(openTag) {
 
 /** 楼层作者：优先页面上渲染出来的昵称（剥掉尾巴上的表情 `<img>`），兜底 `data-info` 的 `name_show` → `un`。 */
 function floorAuthor(head, info) {
-  const re = /<span\b[^>]*>/gi;
-  let m;
-  while ((m = re.exec(head)) !== null) {
-    if (!classTokens(m[0]).includes('user_name')) continue;
-    const close = head.indexOf('</span>', m.index + m[0].length);
-    const name = close >= 0 ? htmlToText(head.slice(m.index + m[0].length, close)) : '';
-    if (name) return name;
-    break;
+  const text = String(head ?? '');
+  const scanSpan = createTagScanner(text, text.toLowerCase(), 'span');
+  let m = scanSpan.next(0);
+  while (m !== null) {
+    if (m.closing) { scanSpan.consume(); m = scanSpan.next(m.end); continue; }
+    if (classTokens(text.slice(m.start, m.end)).includes('user_name')) {
+      const close = text.indexOf('</span>', m.end);
+      const name = close >= 0 ? htmlToText(text.slice(m.end, close)) : '';
+      if (name) return name;
+      break;
+    }
+    m = scanSpan(m.end);
   }
   return htmlToText(String(info?.name_show ?? info?.un ?? ''));
 }
 
 /** 楼层时间：`<span class="list_item_time">2026-1-2</span>`（月/日不补零，所以不按位数卡）。 */
 function floorTime(head) {
-  const re = /<span\b[^>]*>/gi;
-  let m;
-  while ((m = re.exec(head)) !== null) {
-    if (!classTokens(m[0]).includes('list_item_time')) continue;
-    const close = head.indexOf('</span>', m.index + m[0].length);
-    if (close < 0) break;
-    const text = htmlToText(head.slice(m.index + m[0].length, close));
-    if (text) return text;
+  const src = String(head ?? '');
+  const scanSpan = createTagScanner(src, src.toLowerCase(), 'span');
+  let m = scanSpan(0);
+  while (m !== null) {
+    if (m.closing) { scanSpan.consume(); m = scanSpan.next(m.end); continue; }
+    if (classTokens(src.slice(m.start, m.end)).includes('list_item_time')) {
+      const close = src.indexOf('</span>', m.end);
+      if (close < 0) break;
+      const text = htmlToText(src.slice(m.end, close));
+      if (text) return text;
+    }
+    m = scanSpan(m.end);
   }
-  return (head.match(/\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?/) ?? [])[0] ?? '';
+  return (src.match(/\d{4}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{2})?/) ?? [])[0] ?? '';
 }
 
 /**
@@ -662,16 +932,19 @@ function floorTime(head) {
  * **只有带 `content` 正文容器的 `<li>` 才算一层**：被截断或结构变化的残块不该被算成楼层。
  */
 function parseMobileFloors(html, maxPosts) {
+  const src = String(html ?? '');
+  const scanLi = createTagScanner(src, src.toLowerCase(), 'li');
   const opens = [];
-  const re = /<li\b[^>]*>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const tag = m[0];
-    if (!classTokens(tag).includes('post_list_item')) continue;
-    const info = floorDataInfo(tag);
-    const floor = Number((tag.match(/\bfn="(\d+)"/i) ?? [])[1] ?? info?.floor_num ?? NaN);
-    if (!Number.isFinite(floor)) continue;
-    opens.push({ start: m.index, end: m.index + tag.length, floor, info });
+  let m = scanLi.next(0);
+  while (m !== null) {
+    if (m.closing) { m = scanLi.next(m.end); continue; }
+    const tag = src.slice(m.start, m.end);
+    if (classTokens(tag).includes('post_list_item')) {
+      const info = floorDataInfo(tag);
+      const floor = Number((tag.match(/\bfn="(\d+)"/i) ?? [])[1] ?? info?.floor_num ?? NaN);
+      if (Number.isFinite(floor)) opens.push({ start: m.start, end: m.end, floor, info });
+    }
+    m = scanLi(m.end);
   }
 
   const posts = [];
@@ -681,25 +954,24 @@ function parseMobileFloors(html, maxPosts) {
     const block = html.slice(open.end, blockEnd);
     // 正文：块内第一个 class token 里正好有 `content` 的 `<div>`。类名相等而不是子串，`floor_content`
     // （楼中楼）因此不会顶替楼层正文——真实页里两种类名就在同一个 `<li>` 内相邻出现。
-    const tagRe = /<div\b[^>]*>/gi;
+    const scanDiv = createTagScanner(block, block.toLowerCase(), 'div');
     let contentOpen = null;
-    let cm;
-    while ((cm = tagRe.exec(block)) !== null) {
-      if (classTokens(cm[0]).includes('content')) {
-        contentOpen = cm;
-        break;
-      }
+    let cm = scanDiv.next(0);
+    while (cm !== null) {
+      if (!cm.closing && classTokens(block.slice(cm.start, cm.end)).includes('content')) { contentOpen = cm; break; }
+      cm = scanDiv.next(cm.end);
     }
     if (!contentOpen) continue;
-    const bodyStart = contentOpen.index + contentOpen[0].length;
+    const contentTag = block.slice(contentOpen.start, contentOpen.end);
+    const bodyStart = contentOpen.end;
     // 作者 / 时间只在正文之前那段里找：楼中楼的作者与正文都在正文之后，天然排除。
-    const head = block.slice(0, contentOpen.index);
+    const head = block.slice(0, contentOpen.start);
     posts.push({
       floor: open.floor,
       author: cut(floorAuthor(head, open.info), 40),
       time: cut(floorTime(head), 24),
       content: cut(htmlToText(readDivBody(block, bodyStart)), CONTENT_MAX),
-      isOp: /lz="1"/i.test(contentOpen[0])
+      isOp: /lz="1"/i.test(contentTag)
     });
   }
   return posts;
@@ -709,12 +981,29 @@ function parseMobileFloors(html, maxPosts) {
  * PC 形态兜底（`div.l_post` + `p_author_name` + `d_post_content`）。
  * 真实 PC 页在本机实测只回 7091 字节空壳（`<title>贴吧小程序</title>`），留着它是为了页面改版时还有人认。
  */
+/** PC 兜底里单层正文的最大长度：超过就不当楼层（真实楼层正文 < 2KB，CONTENT_MAX=800）。 */
+const PC_FLOOR_BODY_MAX = 40000;
+
 function parsePcFloors(html, maxPosts) {
   const posts = [];
-  const marker = /<div[^>]*class="[^"]*d_post_content[^"]*"[^>]*>([\s\S]*?)<\/div>/gi;
-  let m;
-  while ((m = marker.exec(html)) !== null && posts.length < maxPosts) {
-    const before = String(html).slice(Math.max(0, m.index - 1200), m.index);
+  const src = String(html ?? '');
+  const lower = src.toLowerCase();
+  const scanDiv = createTagScanner(src, lower, 'div');
+  // `</div>` 的位置按需前进且**单调**：每层都重搜一次的话，没有闭合标签的畸形页面
+  // （1MB 的 `<div class="d_post_content">`）会让每个候选都扫到文末，又是 O(n²)。
+  let nextClose = lower.indexOf('</div');
+  let m = scanDiv.next(0);
+  while (m !== null && posts.length < maxPosts) {
+    if (m.closing) { m = scanDiv.next(m.end); continue; }
+    const tag = src.slice(m.start, m.end);
+    // 原正则只认双引号的 class（`class="…d_post_content…"`），这里保持一致。
+    if (!/class="[^"]*d_post_content[^"]*"/i.test(tag)) { m = scanDiv.next(m.end); continue; }
+    if (nextClose >= 0 && nextClose < m.end) nextClose = lower.indexOf('</div', m.end);
+    if (nextClose < 0) break;                       // 后面不会再有闭合标签了
+    const closeAt = nextClose;
+    if (closeAt - m.end > PC_FLOOR_BODY_MAX) { m = scanDiv.next(m.end); continue; }
+    const bodyHtml = src.slice(m.end, closeAt);
+    const before = src.slice(Math.max(0, m.start - 1200), m.start);
     // 取**最后**一个 data-field：短正文时前面 1200 字符里会夹着上一层的 data-field。
     const fields = [...before.matchAll(/data-field=(?:"([^"]*)"|'([^']*)')/g)];
     const last = fields.length ? fields[fields.length - 1][1] ?? fields[fields.length - 1][2] ?? '' : '';
@@ -723,9 +1012,10 @@ function parsePcFloors(html, maxPosts) {
       floor: Number.isFinite(floor) ? floor : posts.length + 1,
       author: cut(htmlToText((before.match(/class="p_author_name[^>]*>([\s\S]*?)<\/(?:a|div)>/i) ?? [])[1] ?? ''), 40),
       time: cut((before.match(/class="p_tail[^"]*"[^>]*>[\s\S]{0,200}?(\d{4}-\d{2}-\d{2}[^<]*)</i) ?? [])[1] ?? '', 24),
-      content: cut(htmlToText(m[1]), CONTENT_MAX),
+      content: cut(htmlToText(bodyHtml), CONTENT_MAX),
       isOp: false
     });
+    m = scanDiv.next(closeAt + 6);
   }
   return posts;
 }
@@ -959,29 +1249,102 @@ function normalizeImageUrl(raw) {
   return acceptImageUrl(text);
 }
 
-/** 从一段 HTML 里挑出图片地址：`<img>` 的懒加载属性优先，其次非 `<img>` 的图片占位容器（真实形态）。 */
+/** 建 div 配对索引时最多登记多少个 `<div>`（正常帖页远达不到；畸形页的兜底）。 */
+const TIEBA_DIV_INDEX_MAX = 20000;
+/** 一次图片提取最多处理多少个正文容器（真实帖页一页 ≤ 30 层，40 层是 MAX_POSTS 上限）。 */
+const TIEBA_IMAGE_BODY_MAX = 60;
+
+/**
+ * 用索引里记的配对位置取正文，语义与 `readDivBody` 一致（含 20KB 扫描上限与兜底）。
+ */
+function divBodyFromFrame(text, frame, maxScan = 20000) {
+  const limit = Math.min(text.length, frame.openEnd + maxScan);
+  if (frame.closeStart >= 0 && frame.closeStart < limit) return text.slice(frame.openEnd, frame.closeStart);
+  const seg = text.slice(frame.openEnd, limit);
+  const naive = seg.search(/<\/div>/i);
+  return naive >= 0 ? seg.slice(0, naive) : seg;
+}
+
+/** 取标签上某个属性的值（线性扫描，不构造正则；`\b` 语义与原来的 `new RegExp` 版本一致）。 */
+function attrOf(tag, name) {
+  const text = String(tag ?? '');
+  const lower = text.toLowerCase();
+  const needle = String(name).toLowerCase();
+  let from = 0;
+  while (from < lower.length) {
+    const at = lower.indexOf(needle, from);
+    if (at < 0) return '';
+    const before = at === 0 ? '' : lower[at - 1];
+    if (before && !/[\s"'<>/]/.test(before)) { from = at + needle.length; continue; }
+    let k = at + needle.length;
+    while (k < lower.length && /\s/.test(lower[k])) k += 1;
+    if (lower[k] !== '=') { from = at + needle.length; continue; }
+    k += 1;
+    while (k < lower.length && /\s/.test(lower[k])) k += 1;
+    const quote = lower[k];
+    if (quote === '"' || quote === "'") {
+      const endQuote = lower.indexOf(quote, k + 1);
+      return endQuote < 0 ? '' : text.slice(k + 1, endQuote);
+    }
+    let valueEnd = k;
+    while (valueEnd < lower.length && !/[\s>]/.test(lower[valueEnd])) valueEnd += 1;
+    return text.slice(k, valueEnd);
+  }
+  return '';
+}
+
+/**
+ * 从一段 HTML 里挑出图片地址：`<img>` 的懒加载属性优先，其次非 `<img>` 的图片占位容器（真实形态）。
+ *
+ * 原实现用两条全局正则（`/<img\b[^>]*>/gi` 与 `/<(?:div|span|a|p)\b[^>]*>/gi`），在
+ * 「一堆 `<img` 但没有 `>`」的畸形片段上同样是 O(n²)；`attr()` 还每个属性都 `new RegExp` 一次。
+ * 这里改成两趟线性标签扫描，**保持原有顺序**（占位容器仍按 div/span/a/p 混排的文档顺序遍历，
+ * 因为去重后的次序会直接影响返回数组，测试是按它断言的）。
+ */
 function imageUrlsInHtml(html) {
+  const src = String(html ?? '');
+  const lower = src.toLowerCase();
   const found = [];
   const push = (raw) => {
     const url = normalizeImageUrl(raw);
     if (url && !found.includes(url)) found.push(url);
   };
-  const attr = (tag, name) => {
-    const m = String(tag).match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
-    return m ? (m[1] ?? m[2] ?? m[3] ?? '') : '';
-  };
-  const imgRe = /<img\b[^>]*>/gi;
-  let m;
-  while ((m = imgRe.exec(String(html))) !== null) {
-    // 懒加载的真图在 data-original / data-src / data-url 里，`src` 常常是 1px 占位或小图。
-    push(attr(m[0], 'data-original') || attr(m[0], 'data-src') || attr(m[0], 'data-url') || attr(m[0], 'src'));
+  // ① `<img>`：懒加载的真图在 data-original / data-src / data-url 里，`src` 常常是 1px 占位。
+  const scanImg = createTagScanner(src, lower, 'img');
+  let i = 0;
+  while (i < src.length) {
+    const tag = scanImg.next(i);
+    if (!tag) break;
+    if (!tag.closing) {
+      const text = src.slice(tag.start, tag.end);
+      push(attrOf(text, 'data-original') || attrOf(text, 'data-src') || attrOf(text, 'data-url') || attrOf(text, 'src'));
+    }
+    i = tag.end;
   }
-  // 真实移动版的楼层照片是**占位容器**（没有 `<img>` 标签，地址在容器自己的 data-* 上）。
-  const holderRe = /<(?:div|span|a|p)\b[^>]*>/gi;
-  while ((m = holderRe.exec(String(html))) !== null) {
-    const tag = m[0];
-    if (!/\bdata-(?:original|src|url)\s*=/i.test(tag)) continue;
-    push(attr(tag, 'data-original') || attr(tag, 'data-src') || attr(tag, 'data-url'));
+  // ② 占位容器（没有 `<img>` 标签，地址在容器自己的 data-* 上）。
+  //    四个标签名各留一个单调游标，每轮取**位置最靠前**的那个 —— 等价于原来那条合并正则的匹配顺序。
+  const names = ['div', 'span', 'a', 'p'];
+  const scanners = new Map(names.map((n) => [n, createTagScanner(src, lower, n)]));
+  const cursor = new Map(names.map((n) => [n, 0]));
+  // 某个标签名一旦找完就记下来：`indexOf` 返回 -1 时已经把整段扫过一遍，若每轮都再问一次
+  // （body 里有 800 个 div 就问 800 次 span/a/p），单段就是 O(div 数 × 段长)。
+  const exhausted = new Set();
+  while (true) {
+    let best = null;
+    let bestName = '';
+    for (const name of names) {
+      if (exhausted.has(name)) continue;
+      const tok = scanners.get(name)(cursor.get(name)); // peek：不消费
+      if (!tok) { exhausted.add(name); continue; }
+      if (!best || tok.start < best.start) { best = tok; bestName = name; }
+    }
+    if (!best) break;
+    scanners.get(bestName).consume();
+    cursor.set(bestName, best.end);
+    if (best.closing) continue;
+    const text = src.slice(best.start, best.end);
+    if (!/\bdata-(?:original|src|url)\s*=/i.test(text)) continue;
+    push(attrOf(text, 'data-original') || attrOf(text, 'data-src') || attrOf(text, 'data-url'));
   }
   return found;
 }
@@ -1004,12 +1367,33 @@ export function extractImageUrls(html, { max = TIEBA_IMAGE_MAX_URLS } = {}) {
   try {
     const text = String(html ?? '');
     if (!text) return { urls: [], found: 0, placeholders: 0 };
-    const tagRe = /<div\b[^>]*>/gi;
-    let m;
-    while ((m = tagRe.exec(text)) !== null) {
-      const tokens = classTokens(m[0]);
+    // 一次性线性建「<div> → 配对 </div>」索引：原来每个候选 div 都调一次 readDivBody 往后扫 20KB，
+    // 畸形页面（几千个 `<div class="content">`）就是 O(候选数 × 20KB)。
+    const lower = text.toLowerCase();
+    const frames = [];
+    const stack = [];
+    const scanDiv = createTagScanner(text, lower, 'div');
+    let cursor = 0;
+    while (frames.length < TIEBA_DIV_INDEX_MAX) {
+      const tag = scanDiv.next(cursor);
+      if (!tag) break;
+      if (tag.closing) {
+        const open = stack.pop();
+        if (open) open.closeStart = tag.start;
+      } else {
+        const frame = { openEnd: tag.end, closeStart: -1, tagText: text.slice(tag.start, tag.end) };
+        stack.push(frame);
+        frames.push(frame);
+      }
+      cursor = tag.end;
+    }
+    let examined = 0;
+    for (const frame of frames) {
+      if (examined >= TIEBA_IMAGE_BODY_MAX) break;
+      const tokens = classTokens(frame.tagText);
       if (!tokens.includes('content') && !tokens.includes('d_post_content')) continue;
-      for (const url of imageUrlsInHtml(readDivBody(text, m.index + m[0].length))) {
+      examined += 1;
+      for (const url of imageUrlsInHtml(divBodyFromFrame(text, frame))) {
         // 占位形态（URL 特征）直接丢弃并计数：交给下游等于给模型 10 张同一张「贴」图标。
         if (isPlaceholderImageUrl(url)) {
           placeholders += 1;
@@ -1135,11 +1519,27 @@ export async function buildTiebaImageContent(urls, {
   maxTotalBytes = TIEBA_IMAGE_TOTAL_BYTES_MAX,
   headers = { referer: 'https://tieba.baidu.com/', 'user-agent': TIEBA_MOBILE_UA }
 } = {}) {
-  const list = (Array.isArray(urls) ? urls : []).filter((u) => typeof u === 'string' && /^https?:\/\//i.test(u));
+  // ① 只接受**贴吧图床**的地址：原来只过滤 `^https?://`，任何公网地址都会被下载；
+  //    图床域名白名单（isTiebaImageHost）此前只在提取阶段用到，构建阶段漏了。
+  // ② 张数/单张字节都夹紧：`maxImages: -1` 会变成 `slice(0, -1)`（少取一张且语义反转），
+  //    `Infinity` 会变成"全取"，`maxBytes: 0/负数` 则让下游校验抛错而不是给个明确上限。
+  const list = (Array.isArray(urls) ? urls : []).filter((u) => {
+    if (typeof u !== 'string' || !/^https?:\/\//i.test(u)) return false;
+    try { return isTiebaImageHost(new URL(u).hostname); } catch { return false; }
+  });
+  // 夹紧语义：NaN/未传 → 默认值；`Infinity`（"我不管上限"）→ **夹到上限**而不是退回默认；
+  // 其余（含负数、0）→ 夹到 [1, 上限]。
+  const boundInt = (value, fallback, max) => {
+    const n = Number(value);
+    if (Number.isNaN(n)) return fallback;
+    return Math.min(max, Math.max(1, Math.floor(n)));
+  };
+  const imageBound = boundInt(maxImages, TIEBA_IMAGE_MAX, TIEBA_IMAGE_MAX_URLS);
+  const byteBound = boundInt(maxBytes, TIEBA_IMAGE_BYTES_MAX, TIEBA_IMAGE_BYTES_MAX);
   const totalBound = Number.isFinite(maxTotalBytes) && maxTotalBytes > 0
     ? Math.floor(maxTotalBytes)
     : TIEBA_IMAGE_TOTAL_BYTES_MAX;
-  const take = list.slice(0, maxImages);
+  const take = list.slice(0, imageBound);
   // 每个槽位一个状态（`ok` 是下载成功，`note` 是失败/去重/占位，`skipped` 是到总量上限没下）。
   const slots = new Array(take.length).fill(null);
   const downloaded = [];
@@ -1153,7 +1553,8 @@ export async function buildTiebaImageContent(urls, {
       break;
     }
     try {
-      const res = await fetchBuffer(take[i], maxBytes, { headers });
+      // 逐跳域名白名单：图床 302 到任意公网主机时在这里被拦下（safeFetchBuffer 每跳都校验）。
+      const res = await fetchBuffer(take[i], byteBound, { headers, allowHost: isTiebaImageHost });
       const buffer = res?.buffer;
       if (!buffer || !buffer.length) throw new Error('图床返回空内容');
       slots[i] = { kind: 'ok', buffer };
@@ -1163,7 +1564,7 @@ export async function buildTiebaImageContent(urls, {
       const message = String(error?.message ?? error);
       // 体积超限与「其它失败」要分开说：前者是设计内的上限，后者是真故障。
       const reason = /大小限制|超过大小/.test(message)
-        ? `因体积超限未取（单张上限 ${imageMiB(maxBytes)}MiB）`
+        ? `因体积超限未取（单张上限 ${imageMiB(byteBound)}MiB）`
         : `获取失败：${message}`;
       slots[i] = { kind: 'note', text: `[图片${i + 1}：${reason}]` };
     }
@@ -1215,7 +1616,7 @@ export async function buildTiebaImageContent(urls, {
     notes.push(`（本次已取 ${content.length} 张；另有 ${skippedByTotal} 张图片因总量上限（一次最多 ${imageMiB(totalBound)}MiB）未取）`);
   }
   const skipped = list.length - take.length;
-  if (skipped > 0) notes.push(`（另有 ${skipped} 张图片因数量上限（一次最多 ${maxImages} 张）未取）`);
+  if (skipped > 0) notes.push(`（另有 ${skipped} 张图片因数量上限（一次最多 ${imageBound} 张）未取）`);
   return { content, notes };
 }
 
@@ -2008,10 +2409,16 @@ export function normalizePatrolConfig(raw) {
 }
 
 /** 自然日 key（本地时区，`YYYY-MM-DD`）：每日上限按它滚动重置。 */
+/** 北京时间相对 UTC 的固定偏移（中国不实行夏令时）。 */
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
+
 export function patrolDayKey(now = Date.now()) {
-  const d = new Date(Number.isFinite(Number(now)) ? Number(now) : Date.now());
+  // 同样按北京时间算自然日：宿主 TZ=UTC 时用本地日期会让「每日 12 次」在北京时间 08:00 重置，
+  // 与「一天」的直觉不符（凌晨那几小时会被算进前一天）。
+  const at = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const d = new Date(at + BEIJING_OFFSET_MS);
   const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
 }
 
 /**
@@ -2035,7 +2442,12 @@ export function patrolTimestamp(at = Date.now()) {
 export function isPatrolQuietHour(now = Date.now(), quietHours = PATROL_DEFAULTS.quietHours) {
   const [start, end] = normalizeQuietHours(quietHours);
   if (start === end) return false;
-  const hour = new Date(Number.isFinite(Number(now)) ? Number(now) : Date.now()).getHours();
+  const at = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  // 小时必须按**北京时间**取。原先用 `getHours()`（宿主本地时区），而云主机 TZ 常是 UTC ——
+  // 于是「夜里 01:00–08:00 静默」实际变成了「北京时间 09:00–16:00 静默」，整个窗口反了 8 小时，
+  // 半夜照逛、白天装睡。同一个坑 `socialV2.proactive.activeHours` 已经踩过一次并修好（见 bridge.js），
+  // 这里补上。中国不实行夏令时，固定 +8 即可，与 model-prices 的 beijingParts 口径一致。
+  const hour = new Date(at + BEIJING_OFFSET_MS).getUTCHours();
   return start < end ? (hour >= start && hour < end) : (hour >= start || hour < end);
 }
 

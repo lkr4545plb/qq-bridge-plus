@@ -159,20 +159,28 @@ export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10
   const outFile = path.join(dir, `p-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
   const run = () => new Promise((resolve) => {
     let child;
+    let fd = null;
+    // 结果落到文件而不是 stdout 管道（受限沙箱里 pipe 会 EPERM）。但**不能用 `-o`**：
+    // ffprobe 从来没有这个选项（`Option not found`，退出码 1），实测在本机导致
+    // 时长/编码探测**每次都静默失败** → 所有语音都跳过时长校验直发网关（超长也不拦）。
+    // 正确做法是把子进程 stdout 直接指向文件描述符，既不用管道也不依赖版本。
     try {
+      fd = fs.openSync(outFile, 'w');
       child = spawn(ffprobePath, [
         '-v', 'error',
         '-show_entries', 'format=duration,format_name',
         '-show_entries', 'stream=codec_name,codec_type,sample_rate,channels',
-        '-of', 'json', '-o', outFile, file
-      ], { windowsHide: true, stdio: 'ignore' });
+        '-of', 'json', file
+      ], { windowsHide: true, stdio: ['ignore', fd, 'ignore'] });
     } catch (error) {
+      try { if (fd !== null) fs.closeSync(fd); } catch {}
       resolve({ code: -1, error: `ffprobe 启动失败：${error?.message ?? error}` });
       return;
     }
-    const timer = setTimeout(() => { try { child.kill(); } catch {} resolve({ code: -2, error: 'ffprobe 超时' }); }, timeoutMs);
-    child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, error: `ffprobe 不可用：${e.message}` }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code }); });
+    const closeFd = () => { try { if (fd !== null) fs.closeSync(fd); } catch {} fd = null; };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} closeFd(); resolve({ code: -2, error: 'ffprobe 超时' }); }, timeoutMs);
+    child.on('error', (e) => { clearTimeout(timer); closeFd(); resolve({ code: -1, error: `ffprobe 不可用：${e.message}` }); });
+    child.on('close', (code) => { clearTimeout(timer); closeFd(); resolve({ code }); });
   });
 
   try {

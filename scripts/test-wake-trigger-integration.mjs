@@ -35,7 +35,10 @@ async function withBridge(run, { wake = {}, config = {}, mode = 'reserved2' } = 
   fakeMath.random = () => { random.count += 1; return random.value; };
   const timers = fakeTimers();
   const h = await bridgeHarness({
-    config: { socialV2: { enabled: true, wake }, ...config },
+    // 钉住时段缩放：本文件断言的是「触发器语义」，不该随运行时刻变化
+    // （sleep 窗口默认 0–8 点，凌晨跑和下午跑会得到不同结果）。
+    // 时段缩放本身由 test-wake-time-scale-integration.mjs 专门覆盖。
+    config: { socialV2: { enabled: true, wake, wakeTimeScale: { enabled: false } }, ...config },
     globals: { Math: fakeMath, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout },
   });
   h.setMode(mode);

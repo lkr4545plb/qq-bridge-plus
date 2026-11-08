@@ -157,6 +157,17 @@ export function evaluateWakeTrigger(st, event, kind, textContent, plainContent, 
       return `speaker:${senderLabel}`;
     }
   }
-  if (Number(tr.probability) > 0 && capabilities.random() < Number(tr.probability)) return 'probability';
+  // 概率触发是**软唤醒**：按时间段打折（睡觉时段 / DS 波峰）。
+  // `probabilityScale` 缺省为 1，既有调用方与测试的行为逐字不变；
+  // 显式触发（上面几条 return）都在这里之前返回，永远看不到这个乘数 —— 半夜被 @ 也必须醒。
+  if (Number(tr.probability) > 0) {
+    // 允许传函数：调用方只在真的要用时才计算（常见配置里 probability=0，
+    // 这条分支根本不会进，没必要每条消息都做一次时区换算 + 节假日表查找）。
+    const rawScale = typeof capabilities?.probabilityScale === 'function'
+      ? capabilities.probabilityScale()
+      : capabilities?.probabilityScale;
+    const scale = Number.isFinite(Number(rawScale)) ? Math.min(1, Math.max(0, Number(rawScale))) : 1;
+    if (capabilities.random() < Number(tr.probability) * scale) return 'probability';
+  }
   return null;
 }

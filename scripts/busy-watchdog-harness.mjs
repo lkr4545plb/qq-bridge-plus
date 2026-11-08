@@ -135,6 +135,10 @@ export async function busyHarness({ config = {}, transformSource = null, globals
     setPresets(value) { dshPresetIds = value; dshDefaultPreset = 'standard'; },
     resetEpoch() { sessionEpoch++; },
     stallProbeConfigV2, maybeStartStallProbeV2, scanBusyWatchdogKeyV2,
+    // 记忆注入（t-mem）：共享 harness 只做"暴露"，断言在 scripts/test-memory-inject.mjs。
+    formatMemoryV2, memoryInjectConfV2, memoryReadBudgetV2, mergeMemoryViewV2, buildWakePromptV2,
+    // 时段缩放（t-wake-time）：纯计算 + 触发判定，断言在 test-wake-time-scale-integration.mjs。
+    wakeTimeScaleNow, scaledWakeProbability, noteWakeScaleSuppressedV2, evaluateWakeTriggerV2,
   };
   bot.onPrivateMessage(async (event) => {`);
   const context = vm.createContext({

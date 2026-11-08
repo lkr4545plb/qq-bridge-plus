@@ -103,6 +103,7 @@ const EXPECTED_SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  'mcp__instabox__',
 ];
 
 function readPreset(id) {

@@ -22,18 +22,31 @@ const ok = (cond, name, extra = '') => {
 };
 
 // 外部进程跑一次（stdio ignore，兼容受限沙箱）
-function run(bin, args, timeoutMs = 60000) {
+function run(bin, args, timeoutMs = 60000, { stdoutFile = null } = {}) {
   return new Promise((resolve) => {
     let child;
-    try { child = spawn(bin, args, { windowsHide: true, stdio: 'ignore' }); }
-    catch (e) { resolve({ code: -1, error: e.message }); return; }
-    const timer = setTimeout(() => { try { child.kill(); } catch {} resolve({ code: -2, error: 'timeout' }); }, timeoutMs);
-    child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, error: e.code || e.message }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code }); });
+    let fd = null;
+    // 需要读输出时把 stdout **直接指向文件**（而不是管道）：受限沙箱里 stdio:pipe 会被拒，
+    // 这也正是生产代码 voice-core.js 用 fd 重定向的原因。
+    // 注意 ffprobe **没有 `-o` 选项**（`Option not found`，退出码 1）——
+    // 旧写法靠 `-o` 落盘，在真装了 ffprobe 的机器上必然失败。
+    const stdio = ['ignore', 'ignore', 'ignore'];
+    try {
+      if (stdoutFile) { fd = fs.openSync(stdoutFile, 'w'); stdio[1] = fd; }
+      child = spawn(bin, args, { windowsHide: true, stdio });
+    } catch (e) {
+      try { if (fd !== null) fs.closeSync(fd); } catch {}
+      resolve({ code: -1, error: e.message });
+      return;
+    }
+    const closeFd = () => { try { if (fd !== null) fs.closeSync(fd); } catch {} fd = null; };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} closeFd(); resolve({ code: -2, error: 'timeout' }); }, timeoutMs);
+    child.on('error', (e) => { clearTimeout(timer); closeFd(); resolve({ code: -1, error: e.code || e.message }); });
+    child.on('close', (code) => { clearTimeout(timer); closeFd(); resolve({ code }); });
   });
 }
-const ffmpeg = (args, t) => run(process.env.FFMPEG_PATH || 'ffmpeg', args, t);
-const ffprobe = (args, t) => run(process.env.FFPROBE_PATH || 'ffprobe', args, t);
+const ffmpeg = (args, t, opts) => run(process.env.FFMPEG_PATH || 'ffmpeg', args, t, opts);
+const ffprobe = (args, t, opts) => run(process.env.FFPROBE_PATH || 'ffprobe', args, t, opts);
 
 /**
  * 自己算 WAV 的 RMS 电平（dBFS）——不依赖 ffmpeg 的统计输出。
@@ -123,7 +136,7 @@ console.log('## 原样不加处理');
     ok(louder.converted === true && fs.existsSync(louder.path), 'volume=3 产出新文件', path.basename(louder.path));
     ok(louder.detail.includes('300%'), 'detail 标明 300%', louder.detail);
     const probeJson = path.join(tmp, 'p.json');
-    const probe = await ffprobe(['-hide_banner', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', '-o', probeJson, '-i', louder.path]);
+    const probe = await ffprobe(['-hide_banner', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', '-i', louder.path], 60000, { stdoutFile: probeJson });
     ok(probe.code === 0 && fs.existsSync(probeJson), '处理后的文件能被 ffprobe 正常解析（没写坏）');
     const dur = probe.code === 0 ? JSON.parse(fs.readFileSync(probeJson, 'utf8')).format?.duration : null;
     ok(dur !== null && Math.abs(Number(dur) - 1) < 0.15, '时长保持不变', `${dur}s`);

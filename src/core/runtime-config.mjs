@@ -84,6 +84,13 @@ export function parseRuntimeConfig(file, configPath = 'config.json') {
       authToken: '',
       authHeader: 'authorization',
       authPrefix: 'Bearer',
+      // 事件流的两个 deadline（毫秒）：
+      //  · 握手：建连后 10s 内一帧都没收到就重连 —— 健康 DSH 一定会先发 ready 帧，安全。
+      //  · 空闲：默认 **0 = 不启用**。DSH 在安静时段确实可能几小时不发帧，
+      //    贸然设 90s 会让桥接每 ~93 秒"重连 + 清空在途 collector + 重发 follow 快照"，
+      //    比半开连接更糟。真要用（探测半开连接）建议 ≥ 15 分钟，并先观察日志里是否周期性重连。
+      muxHandshakeTimeoutMs: 10000,
+      muxIdleTimeoutMs: 0,
       // 是否允许把 DSH launch token 发往非回环地址（默认 false：那是进程启动凭据）
       allowRemote: false,
       ...(file.dsh ?? {})
@@ -108,6 +115,16 @@ export function parseRuntimeConfig(file, configPath = 'config.json') {
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
     consolePort: file.consolePort ?? 3100,
+    // 掉线告警：QQ/SnowLuma 连续不可用时落日志 + state/alerts.jsonl，配了 webhook 就推。
+    // 顶层键必须在这里登记，否则会被本函数的"白名单式"默认值合并**整个丢掉** ——
+    // 实测踩过：config.json 写了 alerts.offlineThresholdPolls=1，解析后 cfg.alerts 是
+    // undefined，于是判定一直用默认阈值 3，告警看起来"不工作"。
+    alerts: {
+      webhookUrl: '',
+      offlineThresholdPolls: 3,
+      cooldownMs: 30 * 60_000,
+      ...((file.alerts && typeof file.alerts === 'object' && !Array.isArray(file.alerts)) ? file.alerts : {})
+    },
     consoleToken: file.consoleToken ?? '',
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
@@ -203,6 +220,9 @@ export function parseRuntimeConfig(file, configPath = 'config.json') {
       },
       wake: {
         defaultMode: 'diving',
+        // A3：唤醒提示里的**静态说明**按会话去重（首轮/引导/每 N 轮发全量，其余轮次只带状态）。
+        // 关掉（enabled:false）退回"每次唤醒都发全量说明"的旧行为。
+        promptDedupe: { enabled: true, repeatEvery: 4 },
         preSleepWaitEnabled: true,      // 沉睡前强制观察窗口开关：防止 AI 聊两句就潜水
         preSleepWaitMs: 300000,          // 默认沉睡前至少等待/观察 5 分钟（后台可调）
         recommendedDefaultInfinite: true, // 默认下一次唤醒是否无限期（true=永久潜水等条件；false=有限时长）
@@ -239,6 +259,10 @@ export function parseRuntimeConfig(file, configPath = 'config.json') {
         gapPerCharMs: 20,
         recommendedHint: '普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。'
       },
+      // A1：social-v2 落盘的合并窗口（毫秒）。0 = 关闭合并，逐次同步写。
+      state: {
+        saveDebounceMs: 400
+      },
       wait: {
         defaultMs: 30000,
         minMs: 5000,
@@ -265,6 +289,20 @@ export function parseRuntimeConfig(file, configPath = 'config.json') {
         checkIntervalMaxMs: 90 * 60 * 1000,
         idleThresholdMs: 15 * 60 * 1000,
         probability: 0.3
+      },
+      // 唤醒概率的**时段缩放**（t-wake-time）：只作用于"摇概率"的软唤醒
+      // （主动机会 / triggers.probability / 一代三个概率），显式触发（@、名字、关键词、
+      // 提问、拍一拍、指定成员、私聊）永远不受影响。
+      //
+      // sleep 窗口是**软衰减**，与 proactive.activeHours 的**硬闸门**是两层：
+      //   · activeHours 之外：连概率都不摇（完全静默）；
+      //   · 窗口内但落在 sleep 段：概率 ×sleep.scale；
+      //   · 落在 DS 波峰（复用计价表 peakWindows/peakWeekdays/holidays）：×dsPeak.scale；
+      //   · 两者同时命中就相乘（0.2 × 0.5 = 0.1）。
+      wakeTimeScale: {
+        enabled: true,
+        sleep: { enabled: true, startHour: 0, endHour: 8, scale: 0.2 },
+        dsPeak: { enabled: true, scale: 0.5 }
       },
       feedback: {
         maxLength: 500,
@@ -330,6 +368,45 @@ export function parseRuntimeConfig(file, configPath = 'config.json') {
     ...(cfg.socialV2.tools ?? {})
   };
 
+  // socialV2.memory：记忆的**注入**预算（存储上限是另一套，见 clampSharedMemoryV2）。
+  //
+  // 为什么要有这一节：记忆是每轮唤醒都要重发的文本，此前只有「条数」上限（话题 10 / 印象 5），
+  // 没有「字符」上限 —— 每条话题 200 字、每人 traits 最多 10×50 字，最坏情况单次注入十几 KB，
+  // 而 `context.wakeMaxChars` 只管 messages/recent 那个 packet，管不到记忆块。
+  // 这里补一条字符预算 + 一条 traits 展示上限（存储不变，只是不全都塞进提示）。
+  //
+  // 深合并（与 tools 同理）：旧 config.json 缺这一节时，外层 spread 会把默认值整个盖掉，
+  // 所以必须在这里重新合并一次，且只接受已知字段。
+  // socialV2.wakeTimeScale：深合并两层，旧 config.json 缺这一节时不会丢默认值。
+  const wakeScaleRaw = (cfg.socialV2.wakeTimeScale && typeof cfg.socialV2.wakeTimeScale === 'object' && !Array.isArray(cfg.socialV2.wakeTimeScale))
+    ? cfg.socialV2.wakeTimeScale
+    : {};
+  cfg.socialV2.wakeTimeScale = {
+    enabled: wakeScaleRaw.enabled !== false,
+    sleep: {
+      enabled: !(wakeScaleRaw.sleep && wakeScaleRaw.sleep.enabled === false),
+      startHour: 0, endHour: 8, scale: 0.2,
+      ...((wakeScaleRaw.sleep && typeof wakeScaleRaw.sleep === 'object' && !Array.isArray(wakeScaleRaw.sleep)) ? wakeScaleRaw.sleep : {})
+    },
+    dsPeak: {
+      enabled: !(wakeScaleRaw.dsPeak && wakeScaleRaw.dsPeak.enabled === false),
+      scale: 0.5,
+      ...((wakeScaleRaw.dsPeak && typeof wakeScaleRaw.dsPeak === 'object' && !Array.isArray(wakeScaleRaw.dsPeak)) ? wakeScaleRaw.dsPeak : {})
+    }
+  };
+
+  const memoryRaw = (cfg.socialV2.memory && typeof cfg.socialV2.memory === 'object' && !Array.isArray(cfg.socialV2.memory))
+    ? cfg.socialV2.memory
+    : {};
+  cfg.socialV2.memory = {
+    maxInjectChars: 1800,      // 单次记忆注入的字符预算（400~8000）
+    traitsRenderMax: 4,        // 每个人的 traits 最多展示几条（存储仍保留 10 条）
+    snapshotEnabled: true,     // 每日记忆快照
+    snapshotKeepDays: 30,      // 快照保留天数（1~365）
+    impressionRenderUid: true, // 印象渲染成「昵称（QQ号）」；关掉只显示昵称
+    ...memoryRaw
+  };
+
   // socialV2.voice：语音发送（把准备好的音频文件当 QQ 语音发出去）。
   // dir 为相对仓库根目录的语音库路径；AI 的 qq_send_voice 默认只能从这个目录取文件，
   // 绝对路径需要显式开 allowAbsolutePath（默认关，避免 prompt injection 读到任意本地文件）。
@@ -337,8 +414,39 @@ export function parseRuntimeConfig(file, configPath = 'config.json') {
   // 默认**关闭**（enabled/sendVoice 均为 false）：语音是"开口说话"的强表达，且需要你先准备好
   // 语音库内容。没放音频就让 AI 发语音只会得到一串错误。把音频放进 audio/ 后，
   // 在控制台「二代仿真 → 语音库与语音发送」里打开开关即可。
+  // 本地图片库（表情包）：qq_send_image 的 file 参数只允许取这些目录里的图片。
+  // 留空 = 用默认（dsh-meme 插件自带的 memes 根目录）。
+  cfg.socialV2.image = {
+    libraryDirs: [],
+    ...(cfg.socialV2?.image ?? {})
+  };
+
   cfg.socialV2.voice = {
+    transcribe: {
+      enabled: true,
+      timeoutMs: 1500,
+      engine: 'auto',
+      local: {
+        enabled: true,
+        silkDecoder: '/opt/local-asr/bin/silk-decoder',
+        whisperBin: '/opt/local-asr/bin/whisper-cli',
+        model: '/opt/local-asr/models/ggml-base.bin',
+        libPath: '/opt/local-asr/bin',
+        language: 'zh',
+        timeoutMs: 120000
+      }
+    },
     enabled: false,
+    // TTS（文字合成语音）参数。voice 是默认音色，单次调用可用 qq_send_speech 的 voice 覆盖；
+    // rate/volume 为百分比（如 +10%），pitch 为 Hz（如 +5Hz），留空即不传。
+    tts: {
+      voice: 'zh-CN-XiaoxiaoNeural',
+      python: 'python3',
+      timeoutMs: 30000,
+      rate: '',
+      pitch: '',
+      volume: ''
+    },
     dir: 'audio',
     maxSeconds: 300,
     maxBytes: 20 * 1024 * 1024,

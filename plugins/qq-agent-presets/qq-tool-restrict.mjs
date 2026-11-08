@@ -181,6 +181,10 @@ const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  // 2026-11-06 按操作者要求放行 InstaBox（安卓云机控制台）：截图、点按、装应用、任意
+  // adb shell。它**不是**只读工具 —— 放行的边界就是那台云机本身（一台独立的 redroid），
+  // 碰不到宿主机；但模型确实能操作上面登录的账号，请按这个前提理解这条放行。
+  'mcp__instabox__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
@@ -206,6 +210,18 @@ const SAFE_EXACT = new Set([
   'qq_tieba_list',
   'qq_tieba_read',
   'qq_send_image',
+  // 2026-11-08：dsh-meme 表情包插件（斗图）。只放行「搜图 + 发图」两个：
+  //   · meme_list  —— 按情绪/关键词搜图，返回图库相对路径
+  //   · send_meme  —— 拿候选并渲染
+  // 拿到路径后由 qq_send_image 的 file 参数发到 QQ（本地图库直读，不走图床白名单）。
+  // learn_meme（把群友的表情收进库）与 meme_update（改元数据）是写操作，暂不放行；
+  // 需要"自动偷图"时再单独加，别让模型默认能往图库里写东西。
+  'meme_list',
+  'send_meme',
+  // 2026-11-07 追加：本机环境记忆（dsh-env-memory 插件注册的全局工具）。
+  // 只读快照/变更日志，唯一写操作是往 ~/.dsh/env-memory/NOTES.md 追加一行；
+  // 它描述的正是"这台机器上什么能用、什么不能"，与会话该不该执行命令无关。
+  'env_memory',
 ])
 
 export function apply(ctx) {

@@ -148,10 +148,17 @@ export function buildPatches({ check = false, log = () => {} } = {}) {
     const file = patchFileFor(name);
     const content = renderPatch(name);
     const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
-    const changed = current !== content;
+    // 比较与写盘都要对**行尾**无感：`.gitattributes` 把 `*.yml` 规范成 CRLF，
+    // 而这里生成的是 LF —— 逐字节比较会让"内容一字未改"的文件永远显示"需重新生成"
+    // （test-agent-preset-patches 的 --check 断言就是这么红的）。
+    const normalizeEol = (s) => (s === null ? null : String(s).replace(/\r\n/g, '\n'));
+    const changed = normalizeEol(current) !== normalizeEol(content);
     if (changed && !check) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, content, 'utf8');
+      // 沿用目标文件已有的行尾风格（不存在时按 .gitattributes 的约定写 CRLF），
+      // 免得"重新生成一次"就在 git 里留下整文件的空白差异。
+      const eol = current !== null && /\r\n/.test(current) ? '\r\n' : '\r\n';
+      fs.writeFileSync(file, content.replace(/\n/g, eol), 'utf8');
     }
     log(`${changed ? (check ? '✗ 需重新生成' : '✓ 已生成') : '· 已是最新'} ${path.relative(REPO_ROOT, file)}`);
     results.push({ file, changed });

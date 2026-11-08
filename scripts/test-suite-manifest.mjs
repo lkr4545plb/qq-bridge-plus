@@ -52,6 +52,26 @@ export const WAKE_TRIGGER_TESTS = ['test-wake-trigger.mjs', 'test-wake-trigger-i
 export const SESSION_ROUTER_TESTS = ['../src/core/session-router.test.mjs'];
 export const REPLY_TIMING_BASELINE_TESTS = ['test-reply-timing-baseline.mjs'];
 export const REPLY_TIMING_POLICY_TESTS = ['test-reply-timing-policy.mjs'];
+// 记忆注入预算（t-mem）：纯算法直测 + 真桥接接线集成。两者都要，缺一不可
+// —— 纯算法全绿但没接线，是这类改动最常见的失败方式（见 test-memory-inject.mjs 文件头）。
+export const MEMORY_BUDGET_TESTS = ['test-memory-budget.mjs', 'test-memory-inject.mjs'];
+
+// 唤醒概率的时段缩放（t-wake-time）：纯窗口/乘数直测 + 真桥接接线（显式触发不受影响）。
+export const WAKE_TIME_SCALE_TESTS = ['test-wake-time-scale.mjs', 'test-wake-time-scale-integration.mjs'];
+
+// 2026-11-05 补进门禁的"门外测试"：这 7 个是自包含的（临时目录/夹具，不读仓库 config.json、
+// 不连 QQ/DSH），此前一直零入口、已经烂过一次（实测 test-stickers 等因硬读 config.json 失败）。
+// 需要外部服务的（test-onebot-connection / test-dsh-* / verify-dsh-0*）仍留在门外，见 docs。
+export const ORPHAN_RESCUED_TESTS = [
+  'test-mcp-safe.mjs', 'test-mcp-host.mjs', 'test-mcp-web-search.mjs', 'test-mcp-servers-stdio.mjs',
+  'test-agent-preset-patches.mjs', 'test-voice-preview.mjs', 'verify-persona-config.mjs',
+];
+
+// 本轮修复自带的回归：state-acl 判定、token 账本压缩、mux 空闲超时、（贴吧安全）。
+export const HARDENING_FIX_TESTS = [
+  'test-state-acl.mjs', 'test-token-ledger-compact.mjs', 'test-mux-idle-timeout.mjs',
+  'test-tieba-safety.mjs', 'test-retry-http.mjs', 'test-tts-voices.mjs', 'test-mcp-agent-token.mjs', 'test-send-cross-session.mjs',
+];
 // 三条纯缝：三份模块直测 + 真桥接边界集成（console-input / persona-text / image-format）。
 export const PURE_SEAM_TESTS = [
   'test-console-input.mjs', 'test-persona-text.mjs', 'test-image-format.mjs',
@@ -92,8 +112,8 @@ export const AGENT_ERROR_NOTICE_TESTS = ['test-agent-error-notice.mjs', 'test-re
 // 独立成组便于维护，同时进入 full 与 quick，不改变既有清单顺序。
 export const RELEASE_TESTS = ['release-privacy-scan.test.mjs'];
 
-export const FULL_TESTS = [...ORIGINAL_FULL_TESTS, ...TEST_FOUNDATION_TESTS, ...WAKE_TIMER_TESTS, ...WATCHDOG_POLICY_TESTS, ...WATCHDOG_SUPPORT_TESTS, ...WAKE_POLICY_TESTS, ...WAKE_TRIGGER_TESTS, ...SESSION_ROUTER_TESTS, ...REPLY_TIMING_BASELINE_TESTS, ...REPLY_TIMING_POLICY_TESTS, ...PURE_SEAM_TESTS, ...MODEL_ENDPOINT_TESTS, ...POLICY_WAVE_TESTS, ...NODE3_TESTS, ...DSH_021_TESTS, ...DSH_CLI_TESTS, ...AGENT_ERROR_NOTICE_TESTS, ...RELEASE_TESTS, ...DSH_CONNECTION_TESTS, ...GROUP_WAIT_BATCH_TESTS];
-export const QUICK_TESTS = [...CORE_TESTS, ...TEST_FOUNDATION_TESTS, ...WAKE_TIMER_TESTS, ...WATCHDOG_POLICY_TESTS, ...WATCHDOG_SUPPORT_TESTS, ...WAKE_POLICY_TESTS, ...WAKE_TRIGGER_TESTS, ...REPLY_TIMING_BASELINE_TESTS, ...REPLY_TIMING_POLICY_TESTS, ...PURE_SEAM_TESTS, ...POLICY_WAVE_TESTS, ...NODE3_TESTS, ...DSH_021_TESTS, ...DSH_CLI_TESTS, ...AGENT_ERROR_NOTICE_TESTS, ...RELEASE_TESTS, ...DSH_CONNECTION_TESTS, ...GROUP_WAIT_BATCH_TESTS];
+export const FULL_TESTS = [...ORIGINAL_FULL_TESTS, ...TEST_FOUNDATION_TESTS, ...WAKE_TIMER_TESTS, ...WATCHDOG_POLICY_TESTS, ...WATCHDOG_SUPPORT_TESTS, ...WAKE_POLICY_TESTS, ...WAKE_TRIGGER_TESTS, ...SESSION_ROUTER_TESTS, ...REPLY_TIMING_BASELINE_TESTS, ...REPLY_TIMING_POLICY_TESTS, ...MEMORY_BUDGET_TESTS, ...WAKE_TIME_SCALE_TESTS, ...HARDENING_FIX_TESTS, ...ORPHAN_RESCUED_TESTS, ...PURE_SEAM_TESTS, ...MODEL_ENDPOINT_TESTS, ...POLICY_WAVE_TESTS, ...NODE3_TESTS, ...DSH_021_TESTS, ...DSH_CLI_TESTS, ...AGENT_ERROR_NOTICE_TESTS, ...RELEASE_TESTS, ...DSH_CONNECTION_TESTS, ...GROUP_WAIT_BATCH_TESTS];
+export const QUICK_TESTS = [...CORE_TESTS, ...TEST_FOUNDATION_TESTS, ...WAKE_TIMER_TESTS, ...WATCHDOG_POLICY_TESTS, ...WATCHDOG_SUPPORT_TESTS, ...WAKE_POLICY_TESTS, ...WAKE_TRIGGER_TESTS, ...REPLY_TIMING_BASELINE_TESTS, ...REPLY_TIMING_POLICY_TESTS, ...MEMORY_BUDGET_TESTS, ...WAKE_TIME_SCALE_TESTS, ...HARDENING_FIX_TESTS, ...ORPHAN_RESCUED_TESTS, ...PURE_SEAM_TESTS, ...POLICY_WAVE_TESTS, ...NODE3_TESTS, ...DSH_021_TESTS, ...DSH_CLI_TESTS, ...AGENT_ERROR_NOTICE_TESTS, ...RELEASE_TESTS, ...DSH_CONNECTION_TESTS, ...GROUP_WAIT_BATCH_TESTS];
 
 function assertUnique(list, label) {
   const seen = new Set();

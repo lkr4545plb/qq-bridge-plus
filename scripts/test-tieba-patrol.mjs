@@ -60,6 +60,12 @@ function localMs(y, mo, d, h = 12, mi = 0) {
   return new Date(y, mo - 1, d, h, mi, 0, 0).getTime();
 }
 
+// 静默时段按**北京时间**判定（与 bridge 的 activeHours 同口径），所以用例必须按北京墙钟构造，
+// 不能再用 localMs —— 那在 TZ=UTC 的云主机上会偏 8 小时，正是被测的那个 bug。
+function beijingMs(y, mo, d, h = 12, mi = 0) {
+  return Date.UTC(y, mo - 1, d, h - 8, mi, 0, 0);
+}
+
 // ── 假抓取器（贴吧抓取层被替换，测试只关心接线与闸门）──────────────────────
 function fakeThreadPage(tid, page) {
   return { ok: true, url: `https://tieba.invalid/mo/q/m?kz=${tid}&pn=${(Number(page) || 1) - 1}`, data: { tid: String(tid), blocked: false, posts: [] }, text: '【贴吧帖子】fixture 正文' };
@@ -194,12 +200,12 @@ await test('①c 纯闸门：用户明确要求不计数、不受限（20 次 us
 await test('② 纯闸门：每日上限按自然日重置（跨日后再访问 ⇒ 计数从 1 开始）', () => {
   const gate = createTiebaPatrolGate({ config: { dailyVisitCap: 2 } });
   // 23:50 起算：两次访问都还在当天；第三次跨到次日才发生。
-  const day1 = localMs(2026, 10, 8, 23, 50);
+  const day1 = beijingMs(2026, 10, 8, 23, 50);
   assert.equal(gate.request({ reason: 'patrol', at: day1 }).ok, true);
   assert.equal(gate.request({ reason: 'patrol', at: day1 + 1000 }).ok, true);
   assert.equal(gate.request({ reason: 'patrol', at: day1 + 2000 }).code, PATROL_CODE_DAILY_CAP);
   // 跨过午夜（本地时间 2026-10-09 00:00 之后）：新的一天，计数归零。
-  const day2 = localMs(2026, 10, 9, 0, 1);
+  const day2 = beijingMs(2026, 10, 9, 0, 1);
   assert.notEqual(patrolDayKey(day1), patrolDayKey(day2));
   const fresh = gate.request({ reason: 'patrol', at: day2 });
   assert.equal(fresh.ok, true, '次日应重新放行');
@@ -252,15 +258,22 @@ await test('④b 配置归一：非法值回默认，cap=0 是合法值（自主
 
 // ── ⑤ 静默时段 ────────────────────────────────────────────────────────────
 await test('⑤ 静默时段 01:00–08:00：patrol 被拒，user 不受影响', () => {
-  assert.equal(isPatrolQuietHour(localMs(2026, 10, 8, 0, 59)), false, '00:59 还没静默');
-  assert.equal(isPatrolQuietHour(localMs(2026, 10, 8, 1, 0)), true, '01:00 起静默（含起点）');
-  assert.equal(isPatrolQuietHour(localMs(2026, 10, 8, 7, 59)), true);
-  assert.equal(isPatrolQuietHour(localMs(2026, 10, 8, 8, 0)), false, '08:00 已放行（不含终点）');
-  assert.equal(isPatrolQuietHour(localMs(2026, 10, 8, 12, 0), [23, 7]), false, '跨零点区间：中午不静默');
-  assert.equal(isPatrolQuietHour(localMs(2026, 10, 8, 23, 30), [23, 7]), true, '跨零点区间：23:30 静默');
+  assert.equal(isPatrolQuietHour(beijingMs(2026, 10, 8, 0, 59)), false, '北京 00:59 还没静默');
+  assert.equal(isPatrolQuietHour(beijingMs(2026, 10, 8, 1, 0)), true, '北京 01:00 起静默（含起点）');
+  assert.equal(isPatrolQuietHour(beijingMs(2026, 10, 8, 7, 59)), true);
+  assert.equal(isPatrolQuietHour(beijingMs(2026, 10, 8, 8, 0)), false, '北京 08:00 已放行（不含终点）');
+  assert.equal(isPatrolQuietHour(beijingMs(2026, 10, 8, 12, 0), [23, 7]), false, '跨零点区间：中午不静默');
+  assert.equal(isPatrolQuietHour(beijingMs(2026, 10, 8, 23, 30), [23, 7]), true, '跨零点区间：23:30 静默');
+
+  // 回归：宿主 TZ=UTC（云主机的常态）时不能按 UTC 小时判。
+  // 北京 09:05 = UTC 01:05 —— 落在 UTC 的 01:00–08:00 里，但**不在**北京的静默时段。
+  assert.equal(isPatrolQuietHour(Date.parse('2026-11-05T01:05:00Z')), false,
+    'TZ=UTC 的机器上，北京上午 9 点必须放行（原先会误判成静默）');
+  // 北京 01:05 = 前一天 UTC 17:05 —— 这才该静默。
+  assert.equal(isPatrolQuietHour(Date.parse('2026-11-04T17:05:00Z')), true, '北京凌晨 1 点必须静默');
 
   const gate = createTiebaPatrolGate({ config: PATROL_DEFAULTS });
-  const quiet = localMs(2026, 10, 8, 3, 0);
+  const quiet = beijingMs(2026, 10, 8, 3, 0);
   const denied = gate.request({ reason: 'patrol', at: quiet });
   assert.equal(denied.ok, false);
   assert.equal(denied.code, PATROL_CODE_QUIET_HOURS);
