@@ -20,8 +20,13 @@ test('reserved2 YAML resolves to the expected persona and template variables', (
 
 test('local/admin tool restrictions and existing compaction budgets stay intact', () => {
   assert.deepEqual(preset.map((row) => row.id), [
-    'persona', 'tool-web', 'tool-ask-user', 'tool-todo', 'qq-tool-restrict', 'compaction',
+    'persona', 'tool-web', 'tool-ask-user', 'tool-todo',
+    // 2026-11-10 起本地工具真正挂载（守卫放行 ≠ 挂载；之前只有守卫没有行，模型看不到）
+    'shell-env', 'tool-bash', 'tool-fs', 'tool-fs-search', 'permission',
+    'qq-tool-restrict', 'compaction',
   ]);
+  // 无头 QQ 会话没有人工审批：permission 必须被覆盖为 danger-full-access（never）。
+  assert.deepEqual(preset.find((row) => row.id === 'permission').config, { defaultPreset: 'danger-full-access' });
   assert.deepEqual(preset.find((row) => row.id === 'tool-web').config, { search: false, fetch: false });
   assert.equal(preset.find((row) => row.id === 'qq-tool-restrict').name, './qq-tool-restrict.mjs');
   const compaction = preset.find((row) => row.id === 'compaction');
