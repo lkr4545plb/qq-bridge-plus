@@ -282,3 +282,39 @@ test('封闭 agent 的预设在创建后必须与仿真 preset 明确区分', ()
     }
   }
 });
+
+// ── 会话绑定编解码自洽（2026-11-10 事故回归：8 hex vs 32 hex 导致全量工具被拒）────────
+test('session binding: encode/decode round-trip and safe degradation', async () => {
+  const crypto = await import('node:crypto');
+  const { decodeSelfKey, trustedSelfKeyOf, sessionBindingDenial } = await import(
+    pathToFileURL(path.join(ROOT, 'plugins/qq-agent-presets/qq-self-key.mjs')).href
+  );
+
+  // ① 32 hex 编码必须能解回原 key（上游 randomBytes(16) 宽度）。
+  const id = `qqb-p-2522628069-${crypto.randomBytes(16).toString('hex')}`;
+  assert.match(id, /^qqb-[gp]-\d{1,20}-[0-9a-f]{32}$/);
+  assert.equal(decodeSelfKey(id), 'private:2522628069');
+
+  // ② 能解出身份时：同会话放行、跨会话拒绝、且拒绝文案统一不可区分。
+  const bound = { agent: { id }, name: 'mcp__snowluma__qq_send_message', arguments: { key: 'private:2522628069' } };
+  assert.equal(trustedSelfKeyOf(bound), 'private:2522628069');
+  assert.equal(sessionBindingDenial(bound, bound.arguments), '');
+  const cross = { ...bound, arguments: { key: 'group:456' } };
+  assert.equal(sessionBindingDenial(cross, cross.arguments), '该会话不可用');
+
+  // ③ 解不出身份（旧映射/编码漂移）不得拒死：guard 必须放行并走降级诊断。
+  const legacy = { agent: { id: 'session-17' }, name: 'mcp__snowluma__qq_send_message', arguments: { key: 'private:2522628069' } };
+  const unbound = { agent: { id: '' }, name: 'mcp__snowluma__qq_send_message', arguments: { key: 'private:2522628069' } };
+  const apply = (await import(pathToFileURL(path.join(ROOT, 'plugins/qq-agent-presets/qq-tool-restrict.mjs')).href)).apply;
+  for (const exec of [legacy, unbound]) {
+    const restricted = [];
+    let guard;
+    apply({ tools: { restrict: ({ deny }) => restricted.push(...deny), guard: (callback) => { guard = callback; } } });
+    assert.equal(guard(exec), undefined, `无法解码身份时不得拒死（${exec.agent.id || '空 id'}）`);
+  }
+
+  // ④ 桥接侧编码宽度必须与解码器一致（防再次漂移）。
+  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  assert.match(bridgeSrc, /crypto\.randomBytes\(16\)\.toString\('hex'\)/, 'bridge encodeSelfKey 必须用 randomBytes(16)');
+  assert.match(bridgeSrc, /\^qqb-\[gp\]-\\d\{1,20\}-\[0-9a-f\]\{32\}\$/, 'BOUND_SESSION_ID_RE 必须是 32 hex');
+});

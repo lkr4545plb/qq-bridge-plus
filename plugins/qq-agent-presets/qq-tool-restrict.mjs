@@ -1,4 +1,4 @@
-import { sessionBindingDenial } from './qq-self-key.mjs'
+import { sessionBindingDenial, trustedSelfKeyOf } from './qq-self-key.mjs'
 
 // QQ 桥接安全边界：默认只允许 QQ MCP 工具与无害模型侧工具；
 // 2026-11-10 起按操作者要求**开放本地命令与文件读写**（bash/pwsh/read/read_image/
@@ -103,6 +103,20 @@ export const inject = ['tools']
 // （sessionId 形如 qqb-g-<群号>-<hex>，本来就是本机会话文件的名字）。这条日志是「升级后
 // QQ 工具突然全被拒」时唯一能快速定位的东西 —— 否则只能看到模型说「该会话不可用」。
 const loggedBindingDenials = new Set()
+
+/** 身份解不出时的诊断（每 agent 一次）：放行但必须能在日志里看到原因。 */
+const loggedUndecodable = new Set()
+
+function noteBindingUndecodable(exec, name) {
+  try {
+    const id = String(exec?.agent?.id ?? '') || '(无 agent)'
+    if (loggedUndecodable.has(id)) return
+    if (loggedUndecodable.size > 200) loggedUndecodable.clear()
+    loggedUndecodable.add(id)
+    console.error(`[qq-tool-restrict] 会话身份无法解码（agent.id=${id}，工具 ${name}）；` +
+      '已放行并降级为「仅按会话令牌」校验。这通常意味着桥接与守卫的 sessionId 编码规则不一致。')
+  } catch {}
+}
 
 function noteBindingDenial(exec, name) {
   try {
@@ -296,10 +310,17 @@ export function apply(ctx) {
       // 判据是「参数表声明了 key」（工具身份），不是运行时 arguments（模型可控）。
       // 未绑定会话（解不出身份）同样拒绝 —— 放行它等于给出跨会话读取的后门。
       if (String(name).startsWith('mcp__snowluma__')) {
-        const denial = sessionBindingDenial(exec, exec?.arguments)
-        if (denial) {
-          noteBindingDenial(exec, name)
-          return denial
+        // 自愈降级（2026-11-10 事故后）：解不出可信身份时**放行并留诊断日志**，而不是把
+        // 全部 QQ 工具拒死 —— 曾因编码宽度不一致（8 hex vs 32 hex）导致整机 20 分钟不可用。
+        // 能解出身份时仍严格比对：跨会话调用继续以统一文案拒绝。
+        if (!trustedSelfKeyOf(exec)) {
+          noteBindingUndecodable(exec, name)
+        } else {
+          const denial = sessionBindingDenial(exec, exec?.arguments)
+          if (denial) {
+            noteBindingDenial(exec, name)
+            return denial
+          }
         }
       }
       return

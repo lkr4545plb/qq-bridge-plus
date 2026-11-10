@@ -860,13 +860,15 @@ function canonicalV2Key(key) {
 // 编码进去的 sessionId（`qqb-g-<群号>-<hex>` / `qqb-p-<QQ号>-<hex>`），preset 里的
 // qq-tool-restrict 守卫从 exec.agent.id 解出可信身份，凡带 `key` 的 QQ 工具调用都必须
 // 指向它自己 —— 模型/注入文本改不了这个值。
-const BOUND_SESSION_ID_RE = /^qqb-[gp]-\d{1,20}-[0-9a-f]{8}$/;
+const BOUND_SESSION_ID_RE = /^qqb-[gp]-\d{1,20}-[0-9a-f]{32}$/;
 function encodeSelfKey(key) {
   const m = /^(group|private):(\d{1,20})$/.exec(String(key ?? '').trim());
   if (!m) return '';
   const id = Number(m[2]);
   if (!Number.isSafeInteger(id) || id <= 0) return '';
-  const rand = crypto.randomBytes(4).toString('hex');
+  // 必须与 qq-self-key.mjs 的 BOUND_ID_RE 同宽（16 字节 = 32 hex）：曾因写成 4 字节
+  // 导致 decodeSelfKey 永远解不出 → 所有带 key 的工具调用被判「该会话不可用」。
+  const rand = crypto.randomBytes(16).toString('hex');
   return `qqb-${m[1] === 'group' ? 'g' : 'p'}-${id}-${rand}`;
 }
 
