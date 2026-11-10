@@ -494,4 +494,38 @@ await test('malformed HTTP request targets return 400 without hanging', async (h
   finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
 }
 
+// 清上下文 ≠ 清记忆（2026-11-10 事故回归）：/api/session/reset 必须保留 activeTopics/
+// pendingThoughts/memberImpressions，并在删除前落一份 pre-reset 记忆快照。
+{
+  const h = await bridgeHarness();
+  h.setMode('reserved2');
+  const server = h.startConsoleServer();
+  try {
+    if (!server.listening) await new Promise((resolve) => server.once('listening', resolve));
+    const port = server.address().port;
+    const post = (pathname, body) => new Promise((resolve, reject) => {
+      const payload = JSON.stringify(body ?? {});
+      const request = http.request({ host: '127.0.0.1', port, path: pathname, method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-console-token': 'fixture-console-token' } },
+        (response) => { let data = ''; response.on('data', (c) => { data += c; }); response.on('end', () => resolve({ status: response.statusCode, body: data })); });
+      request.on('error', reject); request.end(payload);
+    });
+    const KEY = 'group:456';
+    await h.ensureSession(KEY);
+    const stateFile = path.join(h.temp, 'state', 'social-v2.json');
+    const readState = () => JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    let res = await post('/api/socialV2/memory-append', { key: KEY, category: 'pendingThought', content: '清上下文也要保留的记忆' });
+    assert.equal(res.status, 200, `memory-append 应成功：${res.body}`);
+    assert.equal((readState().conversations[KEY]?.pendingThoughts ?? []).length, 1, '写入后应有 1 条想法');
+    res = await post('/api/session/reset', { key: KEY });
+    assert.equal(res.status, 200, `reset 应成功：${res.body}`);
+    const after = readState();
+    assert.equal((after.conversations[KEY]?.pendingThoughts ?? []).length, 1, 'reset 后记忆必须保留');
+    const snaps = fs.readdirSync(path.join(h.temp, 'state', 'memory-snapshots')).filter((n) => n.includes('manual'));
+    assert.ok(snaps.length >= 1, 'reset 前必须落 pre-reset 快照');
+    console.log('PASS reset preserves memory and writes a pre-reset snapshot');
+  } catch (error) { failures++; console.error('FAIL reset memory preservation:', error.message); }
+  finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
+}
+
 if (failures) process.exitCode = 1;

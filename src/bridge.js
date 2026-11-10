@@ -4130,6 +4130,26 @@ async function main() {
   }
 
   /**
+   * 清「会话上下文」但默认**保留记忆**（2026-11-10 事故：reset 把 activeTopics/
+   * pendingThoughts/memberImpressions 一起删了）。记忆是长期资产：换 session、清消息
+   * 不该顺手清它；要连记忆一起清，显式传 keepMemory=false。
+   */
+  function clearConversationWithMemoryV2(key, { keepMemory = true } = {}) {
+    const st = socialV2.conversations.get(key);
+    if (!st) return;
+    const mem = keepMemory ? {
+      activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics : [],
+      pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts : [],
+      memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {}
+    } : null;
+    socialV2.conversations.delete(key);
+    if (mem && (mem.activeTopics.length || mem.pendingThoughts.length || Object.keys(mem.memberImpressions).length)) {
+      const fresh = getSocialV2State(key);
+      if (fresh) Object.assign(fresh, mem);
+    }
+  }
+
+  /**
    * 让 DSH 停下一个已经不再属于桥接的会话：先清队列再取消在途 turn，最后归档。
    * 拆出来是因为所有「撤销映射」的路径都必须做同样的事（retireSession / session-reset /
    * workspace-reset / reset，以及控制台的二代状态重置）—— 少一处就会留下
@@ -9922,7 +9942,10 @@ async function main() {
           markReadCalledKeys.delete(key);
           wakeConfigMissCount.delete(key);
           forgetAgentToken(key);
-          socialV2.conversations.delete(key);
+          // 清上下文前先落一份记忆快照（事故善后：快照是唯一可回滚的证据）。
+          try { writeMemorySnapshotV2({ fileName: uniqueSnapshotFileNameV2(manualSnapshotFileNameV2()), reason: 'pre-reset' }); } catch {}
+          // 清上下文 ≠ 清记忆：默认保留 activeTopics / pendingThoughts / memberImpressions。
+          clearConversationWithMemoryV2(key, { keepMemory: true });
           seenForwardIds.delete(key);
           saveSocialV2State();
           saveState();
@@ -14180,7 +14203,10 @@ async function main() {
           markReadCalledKeys.delete(key);
           wakeConfigMissCount.delete(key);
           forgetAgentToken(key);
-          socialV2.conversations.delete(key);
+          // 清上下文前先落一份记忆快照（事故善后：快照是唯一可回滚的证据）。
+          try { writeMemorySnapshotV2({ fileName: uniqueSnapshotFileNameV2(manualSnapshotFileNameV2()), reason: 'pre-reset' }); } catch {}
+          // 清上下文 ≠ 清记忆：默认保留 activeTopics / pendingThoughts / memberImpressions。
+          clearConversationWithMemoryV2(key, { keepMemory: true });
           seenForwardIds.delete(key);
           saveSocialV2State();
           saveState();
