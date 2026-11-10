@@ -1,0 +1,57 @@
+# 上游 qq-bridge 同步盘点与移植清单（2026-11-10）
+
+- 上游 remote 已加入本地：`qqbridge` = https://github.com/Derpyu520/qq-bridge.git（main 已 fetch，可直接 `git show qqbridge/main:src/xxx`）
+- merge-base = `f6f128a`（2026-08-25 20:57 +0800）；两侧内容在 `9df6a7e`/`89c3dc1`（2026-10-03）树哈希完全一致 = 真实分叉点
+- 上游分叉后 116 提交：33 个 patch-id 等价已在本地（10-03 前那批）；63 个未匹配 ≈ 34 个实质代码提交 + 29 个文档/CI/治理/merge
+- 上游最新提交 `4ed0142`（2026-11-06）；src/ 层面 22 文件 +4686/-760，新增 4 文件
+
+## 结论：不能 `git merge` / 整体 cherry-pick
+本地 81 提交深度重构：bridge.js 15,236 行 vs 上游 13,048 行（diff ≈ 万行）；拆出 `src/core/` 25 模块；
+新增 console/、贴吧、语音收发、ASR、图库、掉线告警、模型管理。直接 merge 会产生上千处冲突。
+策略 = **零冲突直拿 + 手工逐项移植**。
+
+## A. 已等价落地（勿重复移植）
+| 上游项 | 本地对应 |
+|---|---|
+| dsh-endpoint.js 桌面随机端口发现（7fff72e） | src/dsh-desktop.js（tasklist+netstat 方案）已解决 |
+| P0 `{{cwd}}`（374cb4f） | 本地 preset 无 `{{cwd}}`（dsh-021-team-patch.mjs 自做 0.2.1 适配） |
+| df700c3 发送队列按会话分链 | enqueueSend/sendChainKeyOf（bridge.js:9945），且多了 lastSendFailed 不吞错 |
+| 596626f sendChain ReferenceError | 本地实现不同（sendMessagesV2），无此 bug |
+| 7c86cdd 唤醒注入完整人格卡 | bridge.js:12713 已有（mtime 缓存不截断） |
+
+## B. P0 安全修复（本地确认缺失，优先移植）
+1. **4ed0142+28bf1de 令牌拆条绕过**：本地 `onebotSend`（bridge.js:10047）只有逐条 `includes` 精确匹配，
+   `sendMessagesV2`（bridge.js:10377）整批无 join 检查 → 拆条即可绕过。上游加 `hasKnownTokenFragment` + 整批前置拒绝
+2. **1d6f889 sanitizeUntrustedText**（qq-model-view.js 新函数）群友可控文本入模净化 — 本地完全没有
+3. **b9d6a84 敏感闸门伪装归一化**：本地 sensitive.js 仅 15 行（上游 80 行的子集）→ 整文件替换，冲突≈0
+4. **c59443c** web_search/web_fetch 结果套不可信数据外壳
+5. **90b413b** 消息 messageId 幂等入库 + 撤回事件处理 — 本地无任何撤回处理
+6. **4d19073** forward-media 只读本会话媒体 + 媒体抓取端口白名单（safe-fetch.js `validateFetchUrl`）
+7. **4de160b** 表情备注/黑话按会话隔离（sticker-lib.js / slang-learner.js + bridge 接线）
+8. **040f159** 执行期会话绑定 selfKeyGuard（mcp-snowluma-safe.js）
+9. **snowluma-conn.js:146** 本地日志泄露 token 前 4 字符（`slice(0,4)+'…'`），上游已改 `(已配置)` — 1 行
+10. **voice-core.js** symlink/junction 逃逸（resolveExistingParent）— 本地 `catch{return abs}` 弱校验；
+    ⚠️ 与本地 EPERM（ffprobe 输出文件）修复做双向合并，别整文件覆盖
+
+## C. 功能优化/bug 修复（值得移植）
+1. aa0b80b DSH 0.2.2 自定义模型思考强度（dsh-client.js）— 本地缺 reasoning/thinking 传参
+2. web-search.js（新 496 行）DSH 同源联网搜索 + mcp-web-search-safe 重设计 — 本地还是旧版 Bing 版
+3. md-to-plain.js ReDoS 限幅（`{0,500}`）+ "2*3*4" 斜体误删修复
+4. forward.js emoji 代理对安全截断（truncateText）
+5. mcp-host-server.js `server.tool`→`registerTool`+Zod（MCP SDK 新 API）
+6. 2649f94 wait 并发拒绝补 retryAfterMs — 本地无
+7. 6ccee53 定时器钳制 `Math.min(86400000, Math.max(0, …))` — 本地 sleep（bridge.js:696）完全无钳制
+8. 176433a #93 reserved2 两处修复；239e6b9 prompt 错误外发收紧；0b2b373 相对实例路径拒绝停止
+9. state-acl.mjs `hasPermissionGrant` + SID（S-1-5-11/32-545/1-0）检测增强 — 本地 360 行版部分有，缺 hasPermissionGrant
+10. 2aca5a3 隐私扫描漏报/静默截断修复 — 对照吸收进本地 scripts/privacy-scan.mjs
+11. token-ledger.js evictionCovered 等
+12. 0ac4233 scripts/stop-bridge-instance.mjs（299 行运维脚本）+ 断线补发
+
+## D. 治理项（自行定夺，非代码同步）
+- 上游 license 改 PolyForm-Noncommercial-1.0.0（e29cff6），本地已改 MIT — 方向相反
+
+## 移植顺序建议（每项独立 commit，可回滚）
+1. 零冲突直拿：snowluma-conn(1行) / sensitive(整文件) / md-to-plain / forward / mcp-host-server / web-search.js 新增
+2. 单文件：dsh-client 思考强度、safe-fetch 端口白名单、voice-core 双向合并
+3. bridge.js 逐项手工：令牌拆条 → sanitizeUntrustedText → 幂等+撤回 → media 会话校验 → 表情/黑话隔离 → 定时器钳制
+4. 每项移植后跑 `npm run test:audit` + 对应 test 脚本
