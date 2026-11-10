@@ -64,7 +64,8 @@ export async function busyHarness({ config = {}, transformSource = null, globals
       archiveSession: async () => success({}),
     },
     sessions: {
-      create: async (params) => { calls.created.push(params); return success({ sessionId: `fixture-${calls.created.length}` }); },
+      // 真 DSH 会按预分配的 sessionId 建会话：照实回传，保持与执行期会话绑定同口径。
+      create: async (params) => { calls.created.push(params); return success({ sessionId: params?.sessionId || `fixture-${calls.created.length}` }); },
       selectModel: async () => success({ selected: { provider: 'fixture', model: 'fixture' } }),
       prompt: async (params) => { calls.prompts.push(params); return success({}); },
       // C-stall 探测唯一用到的 API（与 /api/workspace/reset 同一个）。未注入 impl 时按「DSH 无此 API」处理。

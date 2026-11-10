@@ -16,19 +16,24 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MCP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8');
 
-/** 把源码按 `server.tool(` 切成一个个工具块。 */
+/** 把源码按工具注册调用（`server.tool(` 或本地包装的 `registerTool(`）切成一个个工具块。 */
 function toolBlocks(src) {
   const blocks = [];
-  const marker = 'server.tool(';
-  let from = src.indexOf(marker);
-  while (from !== -1) {
-    const next = src.indexOf(marker, from + marker.length);
-    const text = src.slice(from, next === -1 ? src.length : next);
-    // 工具名取第一个字符串字面量
-    const nameMatch = /server\.tool\(\s*'([^']+)'/.exec(text);
+  const markers = ['server.tool(', 'registerTool('];
+  const hits = [];
+  for (const marker of markers) {
+    let from = src.indexOf(marker);
+    while (from !== -1) { hits.push({ at: from, marker }); from = src.indexOf(marker, from + marker.length); }
+  }
+  hits.sort((a, b) => a.at - b.at);
+  for (let i = 0; i < hits.length; i++) {
+    const from = hits[i].at;
+    const next = i + 1 < hits.length ? hits[i + 1].at : src.length;
+    const text = src.slice(from, next);
+    const nameMatch = /(?:server\.tool|registerTool)\(\s*'([^']+)'/.exec(text);
+    // 跳过包装函数自身的定义（`function registerTool(`）。
+    if (text.startsWith('function registerTool(')) continue;
     blocks.push({ name: nameMatch ? nameMatch[1] : `(未命名@${from})`, text });
-    if (next === -1) break;
-    from = next;
   }
   return blocks;
 }

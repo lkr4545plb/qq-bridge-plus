@@ -73,7 +73,9 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
       archiveSession: async ({ sessionId }) => { calls.archived.push(sessionId); return success({}); },
     },
     sessions: {
-      create: async (params) => { calls.created.push(params); return success({ sessionId: `fixture-${calls.created.length}` }); },
+      // 真 DSH 会按调用方预分配的 sessionId 建会话（执行期会话绑定依赖这一点）：
+      // 这里照实回传 params.sessionId，让「桥接传入的 qqb-… id 被原样保留」可测。
+      create: async (params) => { calls.created.push(params); return success({ sessionId: params?.sessionId || `fixture-${calls.created.length}` }); },
       selectModel: async () => success({ selected: { provider: 'fixture', model: 'fixture' } }),
       prompt: async (params) => { calls.prompts.push(params); return success({}); },
     },

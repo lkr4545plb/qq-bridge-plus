@@ -854,6 +854,22 @@ function canonicalV2Key(key) {
   return `${m[1]}:${id}`;
 }
 
+// ── 执行期会话绑定（上游 040f159）────────────────────────────────────────────
+//
+// DSH 里 Agent.id 就是 SessionId。桥接在 session/create 时预分配一个把 QQ 会话 key
+// 编码进去的 sessionId（`qqb-g-<群号>-<hex>` / `qqb-p-<QQ号>-<hex>`），preset 里的
+// qq-tool-restrict 守卫从 exec.agent.id 解出可信身份，凡带 `key` 的 QQ 工具调用都必须
+// 指向它自己 —— 模型/注入文本改不了这个值。
+const BOUND_SESSION_ID_RE = /^qqb-[gp]-\d{1,20}-[0-9a-f]{8}$/;
+function encodeSelfKey(key) {
+  const m = /^(group|private):(\d{1,20})$/.exec(String(key ?? '').trim());
+  if (!m) return '';
+  const id = Number(m[2]);
+  if (!Number.isSafeInteger(id) || id <= 0) return '';
+  const rand = crypto.randomBytes(4).toString('hex');
+  return `qqb-${m[1] === 'group' ? 'g' : 'p'}-${id}-${rand}`;
+}
+
 const APPROVE_WORDS = new Set(['通过', '同意', '允许', '批准', 'yes', 'y', 'approve', 'ok']);
 const REJECT_WORDS = new Set(['拒绝', '不同意', '不允许', '驳回', 'no', 'n', 'reject', 'deny']);
 
@@ -10642,6 +10658,14 @@ async function main() {
     const epoch = sessionEpoch;
     const policy = sessionPolicy(key);
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
+    const existingRaw = state.sessions[key];
+    // 升级兼容（上游 040f159）：旧版本建的会话 id 由 DSH 自生成（session-…），解不出 QQ
+    // 会话 key，新的执行期闸门会把这类会话的全部带 key 工具调用拒掉（表现为「机器人突然
+    // 不能用任何 QQ 工具」）。这里一次性退役重建；历史仍留在 DSH 里，不会丢。
+    if (existingRaw && !BOUND_SESSION_ID_RE.test(String(existingRaw))) {
+      log(`会话 ${key} 的 id 不是执行期绑定形态（${existingRaw}），退役并按新规则重建`);
+      retireSession(key);
+    }
     const existing = state.sessions[key];
     if (existing) {
       // reset/清空工作区期间旧映射可能尚未清理；发现代际不匹配必须丢弃旧会话，防止复活。
@@ -10689,6 +10713,10 @@ async function main() {
           }
           const params = { workspaceId: wsValue.workspace.workspaceId };
           if (withPreset && preset) params.agentPreset = preset;
+          // 预分配带会话身份的 sessionId：preset 里的 qq-tool-restrict 守卫据此判断
+          // 「这次调用是不是当前会话」，这个值模型看不到也改不了（见 encodeSelfKey）。
+          const boundSessionId = encodeSelfKey(key);
+          if (boundSessionId) params.sessionId = boundSessionId;
           const value = unwrap(await api.sessions.create(params), 'session.create');
           sessionId = value.sessionId;
           if (withPreset && preset) {
@@ -10785,6 +10813,10 @@ async function main() {
   const messageMediaStore = new Map();
   // 二代会话见过的 forward id（有界，避免 recentMessages 滚动淘汰后无法读取刚见过的转发）
   const seenForwardIds = new Map(); // key -> Set<string>
+  // 已入库的 messageId（上游 90b413b）：重连补发/事件重放会让同一条消息重复进上下文。
+  // 有界 LRU：Set 迭代顺序 = 插入顺序，超限时从最老的开始删。
+  const seenMessageIds = new Set();
+  const MAX_SEEN_MESSAGE_IDS = 1000;
 
   // 归一化“指定群友发言唤醒”名单：策略实现见 core/wake-policy.mjs（历史语义冻结）。
   function normalizeSpeakerIdsV2(value) {
@@ -13134,6 +13166,18 @@ async function main() {
 
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
   function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
+    // 幂等（上游 90b413b）：同一条 messageId 只入一次。断线重连时 SnowLuma 会补发
+    // 未确认的消息，若不去重，模型会看到两条一模一样的消息、水位也会被虚增。
+    const msgId = messageId ? String(messageId) : '';
+    if (msgId && seenMessageIds.has(msgId)) return;
+    if (msgId) {
+      seenMessageIds.add(msgId);
+      while (seenMessageIds.size > MAX_SEEN_MESSAGE_IDS) {
+        const oldest = seenMessageIds.values().next().value;
+        if (oldest === undefined) break;
+        seenMessageIds.delete(oldest);
+      }
+    }
     const st = getSocialV2State(key);
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
@@ -14442,6 +14486,57 @@ async function main() {
   }
 
   // 二代拍一拍（notify/poke）事件处理：写入消息流并按需唤醒。
+  /**
+   * 撤回事件（上游 90b413b）：把本地存的消息正文替换为明确占位。
+   *
+   * 为什么必须处理：撤回不是「消息消失」，而是「内容不该再被引用」。留着原文意味着
+   * 模型之后仍能读到已撤回的话，并且 r.jina/转发/引用链里还能把原文吐回去。
+   */
+  function handleRecallNotice(event) {
+    const type = event?.notice_type;
+    if (type !== 'group_recall' && type !== 'friend_recall') return false;
+    const messageId = event?.message_id != null ? String(event.message_id) : '';
+    if (!messageId || currentMode !== 'reserved2') return false;
+    const key = type === 'group_recall'
+      ? convKey('group', String(event.group_id ?? ''))
+      : convKey('private', String(event.user_id ?? ''));
+    const st = socialV2.conversations.get(key);
+    if (!st) return false;
+    const originals = [...(st.recentMessages || []), ...(st.unread || [])]
+      .filter((m) => m && String(m.messageId ?? '') === messageId);
+    if (!originals.length) return false;
+    // 占位：保留 seq 与时间（水位与排序都依赖它们），正文换成明确标记。
+    const placeholder = (m) => ({
+      ...m,
+      text: '[该消息已被撤回]',
+      plain: '[该消息已被撤回]',
+      tail: '',
+      media: [],
+      hasMedia: false,
+      forwardIds: [],
+      hasForward: false,
+      recalled: true
+    });
+    for (const field of ['recentMessages', 'unread']) {
+      st[field] = (st[field] || []).map((m) => (String(m?.messageId ?? '') === messageId ? placeholder(m) : m));
+    }
+    // 派生缓存必须一起清，否则它们还会把原文吐回去。
+    for (const cached of replyInfoCache.keys()) {
+      if (String(cached).startsWith(`${key}:`)) replyInfoCache.delete(cached);
+    }
+    const media = messageMediaStore.get(key);
+    if (media) {
+      media.delete(messageId);
+      for (const m of originals) if (m.seq != null) media.delete(String(m.seq));
+    }
+    for (const m of originals) {
+      for (const fid of m.forwardIds || []) seenForwardIds.get(key)?.delete(String(fid));
+    }
+    saveSocialV2State();
+    log(`已处理撤回：${key} messageId=${messageId}`);
+    return true;
+  }
+
   async function handlePokeNotice(event) {
     if (!event || event.sub_type !== 'poke') return;
     const selfId = event.self_id;
@@ -15110,6 +15205,8 @@ async function main() {
     try { await handleIncoming('group', event.group_id, event, cfg); } catch (error) { log('处理群消息出错:', error?.message ?? error); }
   });
   bot.onNotice('notify', async (event) => {
+    // 撤回事件优先：它的 notice_type 与拍一拍不同，不应互相吞掉。
+    try { if (handleRecallNotice(event)) return; } catch (error) { log('处理撤回事件出错:', error?.message ?? error); }
     try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
   });
 
