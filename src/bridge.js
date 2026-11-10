@@ -7168,9 +7168,13 @@ async function main() {
               poke: normalizeTriggerBool('poke', current.triggers.poke === true),
               keywords: nextKeywords
             },
+            // 上游 176433a（#93）：全局 wake.batchWindowMs 是唯一权威值 —— AI 不显式传该字段
+            // 时跟随全局，不再沿用会话里的旧值（否则旧值会被永久钉死，改全局配置也不生效）。
             batchWindowMs: Number.isFinite(Number(input.batchWindowMs)) && Number(input.batchWindowMs) >= 1000
               ? Math.min(3600000, Math.round(Number(input.batchWindowMs)))
-              : current.batchWindowMs
+              : (Number(cfg.socialV2?.wake?.batchWindowMs) >= 1000
+                ? Math.min(3600000, Math.round(Number(cfg.socialV2.wake.batchWindowMs)))
+                : current.batchWindowMs)
           };
           // 从 active 切回 diving 时，若 AI 没显式保留 anyMessage，则清除，避免“潜水=每条都唤醒”的语义矛盾。
           if (next.mode === 'diving' && !('anyMessage' in inputTriggers)) {
@@ -14393,7 +14397,12 @@ async function main() {
     if (!accepted.result.ok) {
       const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
       const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
-      await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
+      // 上游 239e6b9：prompt 错误对外只发固定人话 + 冷却去重，原文只进日志。
+      log(`[prompt] 消息未被接受 ${key}: ${safeErrText}`);
+      const notice = classifyAgentError(errText, accepted.result.error);
+      if (defaultErrorNoticeGate.shouldSend(key, notice.kind)) {
+        await auditAndSend(key, notice.text);
+      }
       return;
     }
     if (accepted.result.value.command) {
