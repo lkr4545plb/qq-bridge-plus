@@ -60,9 +60,6 @@ const CLOSED_AGENT_PRESETS = ['qsh-closed'];
  *   · schedule_*（无人值守的自我调度）。
  */
 const LOCAL_EXECUTION_TOOLS = [
-  'pwsh', 'bash',
-  'read', 'read_image', 'write', 'edit', 'str_replace_editor',
-  'glob', 'grep',
   'load_workspace_dependencies',
   'subagent', 'subagent_fork', 'list_subagent_models',
   'send_message', 'interrupt_agent', 'list_agents',
@@ -79,6 +76,10 @@ const LOCAL_EXECUTION_TOOLS = [
   'plugin_manager',
   'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete',
 ];
+
+// 2026-11-10 按操作者要求对 QQ 机器人**开放**的本地工具（跑命令、写代码）：
+// 它们必须①不在 restrict 名单里②执行期 guard 放行。要收回边界=从这里删、放回上面。
+const OPENED_LOCAL_TOOLS = ['pwsh', 'bash', 'read', 'read_image', 'write', 'edit', 'str_replace_editor', 'glob', 'grep'];
 
 /**
  * 工具名 → 真实存在与否。抽取实现在 `scripts/dsh-tool-names.mjs`（唯一实现，
@@ -172,6 +173,12 @@ test('守卫的 restrict 名单覆盖每一个已知本地执行工具', async (
         `${id}: 本地工具 "${tool}" 必须在执行期被拒绝，实际返回 ${JSON.stringify(verdict)}`,
       );
     }
+
+    // 反向（2026-11-10 权限开放）：开放的工具不得被隐藏，也必须被 guard 放行。
+    for (const tool of OPENED_LOCAL_TOOLS) {
+      assert.ok(!restricted.has(tool), `${id}: 开放工具 "${tool}" 不应出现在 restrict 名单里`);
+      assert.equal(fakeTools._guard({ name: tool }), undefined, `${id}: 开放工具 "${tool}" 应被 guard 放行`);
+    }
   }
 });
 
@@ -188,7 +195,11 @@ test('守卫导出的名单与本测试的清单一致（防两份名单各自�
     const missing = LOCAL_EXECUTION_TOOLS.filter((t) => !mod.RESTRICTED_TOOL_NAMES.includes(t));
     assert.deepEqual(missing, [],
       `${id}: 守卫导出的名单缺少本地执行工具：${missing.join(', ')}`);
-    // 反向：名单里不该混入"允许的无害工具"。
+    // 反向：名单里不该混入开放工具与"允许的无害工具"。
+    for (const opened of OPENED_LOCAL_TOOLS) {
+      assert.ok(!mod.RESTRICTED_TOOL_NAMES.includes(opened),
+        `${id}: ${opened} 已对 QQ 机器人开放，不应出现在 restrict 名单里`);
+    }
     for (const allowed of ['ask_user_question', 'todo_write']) {
       assert.ok(!mod.RESTRICTED_TOOL_NAMES.includes(allowed),
         `${id}: ${allowed} 是无害模型侧工具，不应出现在 restrict 名单里（会与 SAFE_EXACT 自相矛盾）`);

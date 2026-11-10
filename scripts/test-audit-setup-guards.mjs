@@ -15,11 +15,13 @@ for (const preset of ['qq-chat', 'qq-chat-v2']) {
   } });
   assert.equal(typeof guard, 'function');
   assert.ok(restricted.includes('dev_install_package'));
+  // 2026-11-10：本地命令/文件工具按操作者要求开放，放进放行侧断言。
   for (const name of ['ask_user_question', 'todo_write', 'mcp__snowluma__qq_send_message',
-    'mcp__snowluma-host__snowluma_status', 'mcp__web-search-safe__web_fetch']) {
+    'mcp__snowluma-host__snowluma_status', 'mcp__web-search-safe__web_fetch',
+    'bash', 'read', 'write', 'edit', 'glob', 'grep']) {
     assert.equal(guard({ name }), undefined, `${preset}: expected allowed ${name}`);
   }
-  for (const name of ['web_fetch', 'web_search', 'bash', 'read_file', 'dev_future_tool',
+  for (const name of ['web_fetch', 'web_search', 'read_file', 'dev_future_tool',
     'mcp__untrusted__web_fetch', '', null, undefined]) {
     try { assert.equal(typeof guard({ name }), 'string', `${preset}: must reject ${String(name)}`); }
     catch (error) { failures++; console.error(`FAIL ${error.message}`); }

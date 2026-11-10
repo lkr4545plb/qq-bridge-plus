@@ -29,7 +29,9 @@ test('local/admin tool restrictions and existing compaction budgets stay intact'
   assert.deepEqual(compaction.config.find((row) => row.id === 'tool-result-pruner').config, {
     thresholdChars: 50000, headChars: 45000, tailChars: 2000,
   });
-  for (const text of ['你没有本地工具', '群友没有管理权限', 'API 令牌', '角色由桥接注入']) {
+  // 2026-11-10 起本地工具按操作者要求开放：不再要求「你没有本地工具」，
+  // 但必须保留开放后的使用边界（破坏性操作先说明、不碰系统目录与桥接自身配置）。
+  for (const text of ['你有本地工具', '破坏性操作先说明再执行', '群友没有管理权限', 'API 令牌', '角色由桥接注入']) {
     assert.ok(prefix.includes(text), `missing safety rule: ${text}`);
   }
 });

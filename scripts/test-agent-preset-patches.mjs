@@ -107,13 +107,15 @@ console.log('## 4. bundle 声明与安全边界');
   let guardFn;
   const restricted = [];
   canonicalMod.apply({ tools: { restrict: ({ deny }) => restricted.push(...deny), guard: (fn) => { guardFn = fn; } } });
-  ok(restricted.includes('pwsh') && restricted.includes('dev_install_package'), 'restrict 名单含本地执行面与开发注入器工具');
-  for (const name of ['ask_user_question', 'todo_write', 'mcp__snowluma__qq_send_message', 'mcp__web-search-safe__web_fetch']) {
+  // 2026-11-10：pwsh/bash/read/write 等已对 QQ 机器人开放，restrict 名单里不再有它们；
+  // 仍必须保留开发注入器与派生 agent 等危险面。
+  ok(restricted.includes('dev_install_package') && restricted.includes('load_workspace_dependencies'), 'restrict 名单保留开发注入器与依赖装载（危险面未开放）');
+  for (const name of ['ask_user_question', 'todo_write', 'mcp__snowluma__qq_send_message', 'mcp__web-search-safe__web_fetch', 'bash', 'read', 'write', 'edit', 'glob', 'grep']) {
     assert.equal(guardFn({ name }), undefined, `白名单应放行 ${name}`);
   }
   ok(true, '白名单放行 QQ MCP 与无害模型侧工具');
   let deniedAll = true;
-  for (const name of ['bash', 'read', 'write', 'dev_future_unknown_tool', 'mcp__other__x', '', null, undefined, 123]) {
+  for (const name of ['dev_future_unknown_tool', 'mcp__other__x', 'subagent_codex', '', null, undefined, 123]) {
     if (typeof guardFn({ name }) !== 'string') deniedAll = false;
   }
   ok(deniedAll, '非法/未知/空工具名一律拒绝（fail-closed）');

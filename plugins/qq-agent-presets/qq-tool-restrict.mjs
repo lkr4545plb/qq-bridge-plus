@@ -1,4 +1,8 @@
-// QQ 桥接安全硬边界：只允许 QQ MCP 工具与少量无害模型侧工具。
+// QQ 桥接安全边界：默认只允许 QQ MCP 工具与无害模型侧工具；
+// 2026-11-10 起按操作者要求**开放本地命令与文件读写**（bash/pwsh/read/read_image/
+// write/edit/str_replace_editor/glob/grep）——只开这 9 个，派生 agent、插件装载、
+// 自我调度、快照回滚等仍全部拒绝。要收回：把它们从 SAFE_EXACT 摘掉、放回
+// LOCAL_EXECUTION_TOOLS 即可（restrict 与 guard 两道会一起生效）。
 //
 // 本文件是 qq-agent-presets bundle 里的**唯一权威实现**，由 qq-chat / qq-chat-v2 两个
 // agent preset 的 qq-tool-restrict 行共同引用（dsh/agent-presets/<preset>/qq-tool-restrict.mjs
@@ -94,12 +98,7 @@ export const inject = ['tools']
  *      · `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete`
  */
 const LOCAL_EXECUTION_TOOLS = [
-  // shell / 进程
-  'pwsh', 'bash',
-  // 文件读写
-  'read', 'read_image', 'write', 'edit', 'str_replace_editor',
-  // 文件检索
-  'glob', 'grep',
+  // shell / 文件读写检索：2026-11-10 起对 QQ 机器人开放（见头部说明），不再隐藏。
   // 自带运行时（Python/Node/pnpm 的绝对路径）⇒ 等于把"跑代码"递给模型
   'load_workspace_dependencies',
   // 派生 agent 与编排（都能间接拿到 shell）
@@ -222,6 +221,9 @@ const SAFE_EXACT = new Set([
   // 只读快照/变更日志，唯一写操作是往 ~/.dsh/env-memory/NOTES.md 追加一行；
   // 它描述的正是"这台机器上什么能用、什么不能"，与会话该不该执行命令无关。
   'env_memory',
+  // 2026-11-10 按操作者要求开放：本地命令与文件读写（"跑命令、写代码"）。
+  // restrict 名单里已移除同名条目；仍受 DSH 自身沙箱/审批与其后其余 deny 条目约束。
+  'bash', 'pwsh', 'read', 'read_image', 'write', 'edit', 'str_replace_editor', 'glob', 'grep',
 ])
 
 export function apply(ctx) {
