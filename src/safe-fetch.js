@@ -109,7 +109,20 @@ export function isPrivateIp(ip) {
   return true;
 }
 
-export async function resolveSafeHost(hostname) {
+function orderAddresses(addresses) {
+  const v4 = addresses.filter((item) => Number(item?.family) === 4).map((item) => item.address);
+  const v6 = addresses.filter((item) => Number(item?.family) === 6).map((item) => item.address);
+  const ordered = [];
+  const max = Math.max(v4.length, v6.length);
+  for (let i = 0; i < max; i += 1) {
+    if (v4[i]) ordered.push(v4[i]);
+    if (v6[i]) ordered.push(v6[i]);
+  }
+  return ordered;
+}
+
+/** 解析主机名并校验**全部**解析结果，返回可尝试的地址列表（IPv4 优先）。 */
+export async function resolveSafeAddresses(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (!h) throw new Error('主机名为空');
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) {
@@ -117,7 +130,7 @@ export async function resolveSafeHost(hostname) {
   }
   if (net.isIP(h)) {
     if (isPrivateIp(h)) throw new Error('禁止访问内网/本机地址');
-    return h;
+    return [h];
   }
   let addresses;
   try {
@@ -128,10 +141,21 @@ export async function resolveSafeHost(hostname) {
   if (!addresses.length) throw new Error('域名没有解析结果');
   for (const { address } of addresses) {
     if (isPrivateIp(address)) {
+      if (/^198\.(?:18|19)\./.test(address)) {
+        throw new Error('域名解析到 198.18.0.0/15 保留地址，已阻止；这可能是 Clash/mihomo 的 fake-ip。'
+          + '请使用返回真实公网 IP 的 DNS（如 redir-host），或按代理的 fake-ip-filter 规则让该域名返回真实地址。'
+          + '私有/保留地址不会被放行');
+      }
       throw new Error('域名解析到内网/本机地址，已阻止');
     }
   }
-  return addresses[0].address;
+  const ordered = orderAddresses(addresses);
+  return ordered.length ? ordered : [addresses[0].address];
+}
+
+export async function resolveSafeHost(hostname) {
+  const [first] = await resolveSafeAddresses(hostname);
+  return first;
 }
 
 /**
@@ -152,10 +176,22 @@ export function parseFetchUrl(raw) {
   return url;
 }
 
-export async function validateFetchUrl(raw) {
+export async function validateFetchUrl(raw, opts = {}) {
   const url = parseFetchUrl(raw);
-  const ip = await resolveSafeHost(url.hostname);
-  return { url, ip };
+  // 可选端口白名单：默认不限（保持既有调用方行为），走公网抓取的入口显式传入。
+  //
+  // 为什么需要：SSRF 防护只判定"地址是不是内网"，不判定"端口是不是该服务的端口"。
+  // 一个**公网可达**的非常规端口（比如某内网服务通过端口映射暴露在 8081/9200）在
+  // 地址判定看来是合法的，于是能被拿来探测。端口白名单把"能抓什么"收窄到
+  // 常规 Web 端口，与地址判定互补。
+  if (Array.isArray(opts.allowPorts) && opts.allowPorts.length) {
+    const port = url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80);
+    if (!Number.isInteger(port) || !opts.allowPorts.includes(port)) {
+      throw new Error(`端口 ${port} 不在允许列表（${opts.allowPorts.join('/')}）内，已阻止`);
+    }
+  }
+  const addresses = await resolveSafeAddresses(url.hostname);
+  return { url, ip: addresses[0], addresses };
 }
 
 /**
@@ -193,9 +229,16 @@ function assertAllowedHost(url, allowHost) {
 }
 
 /** 首跳/每一跳的统一入口：语法校验 → **域名白名单** → DNS 解析 → 内网拦截。 */
-async function resolveTarget(raw, allowHost) {
+async function resolveTarget(raw, allowHost, allowPorts) {
   const url = parseFetchUrl(raw);
   assertAllowedHost(url, allowHost);
+  // 可选端口白名单（见 validateFetchUrl 的说明）：SSRF 地址判定之外的端口收窄。
+  if (Array.isArray(allowPorts) && allowPorts.length) {
+    const port = url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80);
+    if (!Number.isInteger(port) || !allowPorts.includes(port)) {
+      throw new Error(`端口 ${port} 不在允许列表（${allowPorts.join('/')}）内，已阻止`);
+    }
+  }
   const ip = await resolveSafeHost(url.hostname);
   return { url, ip };
 }
@@ -352,14 +395,14 @@ export async function safeFetch(urlString, maxChars = 50000, opts = {}) {
   validateLimit(maxChars, 'maxChars');
   const MAX_REDIRECTS = 5;
   let extraHeaders = normalizeHeaderOverrides(opts?.headers);
-  let { url, ip } = await resolveTarget(urlString, opts?.allowHost);
+  let { url, ip } = await resolveTarget(urlString, opts?.allowHost, opts?.allowPorts);
   const origin = url.origin;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const result = await requestOnce(url, ip, maxChars, false, extraHeaders);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, ip } = await resolveTarget(next, opts?.allowHost));
+      ({ url, ip } = await resolveTarget(next, opts?.allowHost, opts?.allowPorts));
       if (url.origin !== origin) extraHeaders = null;
       continue;
     }
@@ -403,14 +446,14 @@ export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024, opt
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let extraHeaders = normalizeHeaderOverrides(opts?.headers);
-  let { url, ip } = await resolveTarget(urlString, opts?.allowHost);
+  let { url, ip } = await resolveTarget(urlString, opts?.allowHost, opts?.allowPorts);
   const origin = url.origin;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const result = await requestOnce(url, ip, maxBytes, true, extraHeaders);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, ip } = await resolveTarget(next, opts?.allowHost));
+      ({ url, ip } = await resolveTarget(next, opts?.allowHost, opts?.allowPorts));
       if (url.origin !== origin) extraHeaders = null;
       continue;
     }

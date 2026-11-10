@@ -283,5 +283,16 @@
       "wakeRecentLimit": 4,
       "wakeMaxChars": 6000
     }
+  },
+  "webSearch": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
   }
 }
