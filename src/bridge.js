@@ -455,13 +455,20 @@ let modelCatalogInFlight = null;
 // 控制台改强度后递增它，让已在运行的会话在下一条消息重新 selectModel；
 // 放在模块级是为了不依赖 main() 内部声明的执行顺序（避免 TDZ）。
 let modelSelectionEpoch = 0;
-// DeepSeek provider 明确支持的取值（见 dsh-llm-deepseek：其它值会抛 UNSUPPORTED_REASONING_EFFORT）。
-// 'off' 虽然合法（关闭思考），但 QQ 聊天助手依赖思考，控制台不提供该档。
+// 目录不可用时的 DeepSeek 兜底档位（DSH 换档位词汇时 GET /api/dsh/model 会跟随目录公布的真实档位，
+// 不再依赖这份清单做校验）。'off' 虽然合法（关闭思考），但 QQ 聊天助手依赖思考，控制台不提供该档。
 const REASONING_EFFORT_DEFAULT = 'max';
+// 'none' = 控制台的「不下发 reasoningEffort」标记：写入配置后 selectModel 会省略该字段，
+// 交给 DSH / 目标模型自己的默认（自定义模型常见的可用形态）。
+const REASONING_EFFORT_NONE = 'none';
+// 档位 id 由 DSH 适配器定义（DeepSeek 是 low/high/max，自定义模型可能返回 medium/xhigh/…），
+// 因此这里只做「非空、单个 id、无空白与控制字符」的基础校验，不再套 DeepSeek 白名单。
 function normalizeReasoningEffort(value) {
   const v = String(value ?? '').trim().toLowerCase();
-  if (!REASONING_EFFORT_OPTIONS.includes(v)) {
-    throw new Error(`思考强度只能是 ${REASONING_EFFORT_OPTIONS.join(' / ')}`);
+  if (!v) throw new Error('思考强度不能为空（要表达「不设置」请用 none）');
+  if (v === REASONING_EFFORT_NONE) return REASONING_EFFORT_NONE;
+  if (v.length > 32 || /[\s\u0000-\u001f\u007f]/.test(v)) {
+    throw new Error('思考强度只能是单个档位 id（不含空白与控制字符）');
   }
   return v;
 }
@@ -4960,6 +4967,9 @@ async function main() {
   async function applyDshModelUpdate(body) {
     const { nextProvider, nextModel, patch, removals, nextEffort: initialEffort } = parseModelUpdateInput(body);
     let nextEffort = initialEffort;
+    // 控制台的 none = 「不下发 reasoningEffort」：映射为空串（与 null 的「显式清空」落盘值一致，
+    // 见 modelSelectionFor 的语义），因此不需要再过目录校验 —— 它不指定任何档位。
+    if (nextEffort === REASONING_EFFORT_NONE) nextEffort = '';
 
     // ② 读盘（只读）：TUI 的既有流程是「先写盘、再调本端点做内存热同步」，
     // 所以目标模型要以**磁盘上的值**为准，不能只看内存 cfg（后者此时还落后一拍）。
@@ -5001,6 +5011,12 @@ async function main() {
         }
       }
       for (const check of effortChecks) {
+        // 'none' = 不指定档位：直接落成空串（显式未设置），不查目录。
+        if (check.value === REASONING_EFFORT_NONE) {
+          if (check.scope === 'global') nextEffort = '';
+          else patch.get(check.key).reasoningEffort = '';
+          continue;
+        }
         let targetProvider = effectiveProvider;
         let targetModel = effectiveModel;
         if (check.scope === 'override') {
@@ -6096,7 +6112,11 @@ async function main() {
             const group = (catalog?.groups ?? []).find((g) => g?.id === provider);
             const entry = (group?.models ?? []).find((m) => m?.id === model);
             const efforts = entry?.reasoning?.efforts ?? [];
-            const advertised = efforts.map((e) => String(e?.id ?? '')).filter((id) => REASONING_EFFORT_OPTIONS.includes(id));
+            // 档位 id 由 DSH 适配器定义，自定义模型可能公布 medium/xhigh 等词；不再按内置
+            // 白名单过滤，只做「非空、单个 id、无空白与控制字符」的基础校验（与 normalizeReasoningEffort 一致）。
+            const advertised = efforts
+              .map((e) => String(e?.id ?? '').trim().toLowerCase())
+              .filter((id) => id && id.length <= 32 && !/[\s\u0000-\u001f\u007f]/.test(id));
             if (advertised.length) {
               options = advertised;
               labels = Object.fromEntries(efforts.map((e) => [String(e.id), { name: e.name ?? '', description: e.description ?? '' }]));
@@ -6111,6 +6131,9 @@ async function main() {
               log(`读取 DSH 模型能力失败，思考强度暂用内置清单：${reason}`);
             }
           }
+          // 控制台始终提供 none（不下发 reasoningEffort）：自定义模型常见的可用形态，
+          // 也是「目录不可用/目录没声明档位」时的安全降级。
+          if (!options.includes(REASONING_EFFORT_NONE)) options = [...options, REASONING_EFFORT_NONE];
           sendJson({
             provider,
             model,
@@ -10532,20 +10555,37 @@ async function main() {
     const sel = modelSelectionFor(key);
     const fingerprint = `${modelSelectionEpoch}|${sel.provider}|${sel.model}|${sel.effort || '(unset)'}`;
     if (modelAppliedSessions.get(sessionId) === fingerprint) return 'applied';
+    // 'none' = 控制台的「不下发 reasoningEffort」：与空串同义（显式未设置）。
+    const configuredEffort = sel.effort === REASONING_EFFORT_NONE ? '' : sel.effort;
+    // 两段式降级：第 1 段按配置带 reasoningEffort；第 2 段去掉 reasoningEffort。
+    // 为什么需要第 2 段：不是每个 model 都有 effort 维度（自定义模型常见），带 effort 的
+    // selectModel 会被拒；'none'/空串直接进入第 2 段。模型明确拒绝档位时还会提前跳出该段，
+    // 不拿同一组参数白重试一次（该错误在 provider I/O 前就确定了）。
+    const modelPlans = configuredEffort
+      ? [{ label: `effort=${configuredEffort}`, effort: configuredEffort }, { label: '无 effort', effort: '' }]
+      : [{ label: '无 effort', effort: '' }];
     let lastError = null;
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      try {
-        // effort 为空 = 未设置/留空：**不下发** reasoningEffort，交给 DSH/目标模型默认。
-        const params = { sessionId, provider: sel.provider, model: sel.model };
-        if (sel.effort) params.reasoningEffort = sel.effort;
-        const result = unwrap(await api.sessions.selectModel(params), 'session.selectModel');
-        modelAppliedSessions.set(sessionId, fingerprint);
-        log(`已设置会话模型 ${sessionId}${key ? ` [${key}]` : ''} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
-        return 'applied';
-      } catch (error) {
-        lastError = error;
-        log(`设置会话模型失败 ${sessionId}${key ? ` [${key}]` : ''}（第 ${attempt}/2 次）: ${error?.message ?? error}`);
-        if (attempt < 2) await sleep(1000);
+    modelPlans: for (const plan of modelPlans) {
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          // effort 为空 = 未设置/留空：**不下发** reasoningEffort，交给 DSH/目标模型默认。
+          const params = { sessionId, provider: sel.provider, model: sel.model };
+          if (plan.effort) params.reasoningEffort = plan.effort;
+          const result = unwrap(await api.sessions.selectModel(params), 'session.selectModel');
+          modelAppliedSessions.set(sessionId, fingerprint);
+          log(`已设置会话模型 ${sessionId}${key ? ` [${key}]` : ''} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
+          return 'applied';
+        } catch (error) {
+          lastError = error;
+          const reason = String(error?.message ?? error);
+          log(`设置会话模型失败 ${sessionId}${key ? ` [${key}]` : ''}（${plan.label}，第 ${attempt}/2 次）: ${reason}`);
+          // 会话在 DSH 侧已经不存在：换 effort 重试也没意义，退出两段（外层退役重建）。
+          if (/not[- ]?found/i.test(reason)) break modelPlans;
+          // 模型明确拒绝思考档位：该错误在 provider I/O 前即确定，换第 2 段（无 effort）即可，
+          // 不要拿同一组参数再撞一次。
+          if (plan.effort && /does not support reasoning effort/i.test(reason)) break;
+          if (attempt < 2) await sleep(1000);
+        }
       }
     }
     const message = String(lastError?.message ?? lastError ?? '');
