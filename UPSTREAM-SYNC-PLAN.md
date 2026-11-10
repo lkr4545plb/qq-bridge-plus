@@ -50,6 +50,34 @@
 ## D. 治理项（自行定夺，非代码同步）
 - 上游 license 改 PolyForm-Noncommercial-1.0.0（e29cff6），本地已改 MIT — 方向相反
 
+## 进度（2026-11-10 更新）
+
+### 批次 1 已完成（7 个 commit，全部测试通过）
+| commit | 内容 |
+|---|---|
+| b99b859 | snowluma-conn 令牌前缀脱敏 |
+| 114a215 | sensitive.js 伪装归一化 + base64 形态识别 |
+| ef34490 | md-to-plain ReDoS 限幅 + 斜体误删 |
+| 566f160 | forward emoji 安全截断 |
+| 6f4d232 | mcp-host-server registerTool 迁移 |
+| 993f139 | web-search.js 同源搜索 + 不可信外壳 + 端口白名单（含 safe-fetch 增量与测试夹具） |
+| d8882ec | 本文档 |
+
+验证：test-audit 106/109（3 个失败均为改动前既有：test-preset-local-tools、
+test-dsh-cli-resolve、test-dsh-discovery-logging）；test-quick 64/66（同两项既有）；
+test-md / test-forward / test-audit-security / test-audit-security-mcp / test-mcp-web-search /
+token-economy 全绿（改动后无回归，已用 stash 做过基线对比）。
+
+### 下一批（批次 2 候选，按优先级）
+1. 令牌拆条绕过（4ed0142+28bf1de）— bridge.js sendMessagesV2/onebotSend + mcp-snowluma-safe
+2. sanitizeUntrustedText（1d6f889）— qq-model-view + bridge 接线
+3. 消息幂等入库 + 撤回事件（90b413b）— bridge.js
+4. forward-media 会话校验（4d19073）— bridge.js 侧（forward 端点侧本地已有部分）
+5. 表情/黑话会话隔离（4de160b）
+6. selfKeyGuard 执行期会话绑定（040f159）
+7. voice-core symlink 逃逸双向合并；state-acl hasPermissionGrant
+8. DSH 0.2.2 思考强度（aa0b80b）— dsh-client
+
 ## 移植顺序建议（每项独立 commit，可回滚）
 1. 零冲突直拿：snowluma-conn(1行) / sensitive(整文件) / md-to-plain / forward / mcp-host-server / web-search.js 新增
 2. 单文件：dsh-client 思考强度、safe-fetch 端口白名单、voice-core 双向合并
