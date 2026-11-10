@@ -79,6 +79,8 @@ export function isPrivateIp(ip) {
     if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
     if (parts[0] === 192 && parts[1] === 168) return true;
     if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+    // Azure WireServer：字面上是公网 IPv4，但在 Azure VM 内指向平台服务（SSRF 可达）。
+    if (h === '168.63.129.16') return true;
     if (parts[0] === 198 && parts[1] >= 18 && parts[1] <= 19) return true;
     if (parts[0] === 192 && parts[1] === 0 && parts[2] === 0) return true;
     if (parts[0] >= 224) return true;
@@ -239,11 +241,19 @@ async function resolveTarget(raw, allowHost, allowPorts) {
       throw new Error(`端口 ${port} 不在允许列表（${allowPorts.join('/')}）内，已阻止`);
     }
   }
-  const ip = await resolveSafeHost(url.hostname);
-  return { url, ip };
+  // 返回**全部**已校验地址（IPv4 优先，见 orderAddresses）：requestOnce 会逐个尝试，
+  // 避免「第一个地址不可达就整个抓取失败」。
+  const addresses = await resolveSafeAddresses(url.hostname);
+  return { url, addresses };
 }
 
 const REQUEST_TIMEOUT_MS = 20000;
+// 多地址时的单次尝试预算：够一次 TCP+TLS+首字节，又不至于让「第一个地址是坏的 IPv6」
+// 把整个请求预算耗光 —— 这是表情包/图片抓取「时好时坏」的根因：域名同时解析出 IPv6 与
+// IPv4 时，旧实现只看解析结果的第一个地址（可能不可达），没有换地址重试。
+const ATTEMPT_TIMEOUT_MS = 8000;
+// 最多换几个地址重试：DNS 返回几十个地址时不该逐个撞完整个 20s 预算。
+const MAX_ADDRESS_ATTEMPTS = 4;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 function validateLimit(value, name) {
@@ -279,8 +289,13 @@ function normalizeHeaderOverrides(raw) {
 // 使用已校验的 IP 发起请求，保留原始 Host/SNI，禁止重新解析 DNS。
 // 总时限包含 TCP/TLS、响应头和响应体；仅 socket idle timeout 无法阻止慢速滴流。
 // `extraHeaders` 为已规范化的追加头（见 normalizeHeaderOverrides）：null 表示一个字节都不加。
-function requestOnce(url, ip, limit, binary = false, extraHeaders = null) {
-  return new Promise((resolve, reject) => {
+//
+// 多地址重试（与上游 safe-fetch 对齐）：一次请求最多尝试 MAX_ADDRESS_ATTEMPTS 个地址。
+//   · 单地址：沿用 20s 整预算（与以前逐字节一致）；
+//   · 多地址：每个地址 8s 软预算，总量不超过总预算；网络层失败（连接拒绝/超时/EOF）
+//     换地址重试，策略层失败（大小超限/协议错误）立即终止 —— 换地址也修不好。
+function attemptOnce(url, address, limit, binary, budgetMs, extraHeaders) {
+  return new Promise((resolve) => {
     let settled = false;
     let req;
     let response;
@@ -288,81 +303,100 @@ function requestOnce(url, ip, limit, binary = false, extraHeaders = null) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (error) reject(error);
-      else resolve(result);
+      if (error) resolve({ ok: false, error, retryable: true });
+      else resolve({ ok: true, result });
+    };
+    const finishPolicy = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok: false, error, retryable: false });
     };
     const timer = setTimeout(() => {
       const error = new Error(`请求超时：${url.hostname}`);
       finish(error);
       req?.destroy(error);
       response?.destroy();
-    }, REQUEST_TIMEOUT_MS);
+    }, budgetMs);
+
     const mod = url.protocol === 'https:' ? https : http;
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
-    // 默认头集合逐字节保持原样（键序也不变）；只有调用方显式传了 headers 时才在后面追加。
-    const headers = {
-      host: url.host,
-      'user-agent': 'Mozilla/5.0',
-      accept: binary ? 'image/*,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'accept-language': 'zh-CN,zh;q=0.9',
-    };
-    if (extraHeaders) Object.assign(headers, extraHeaders);
     try {
+      // 默认头集合逐字节保持原样（键序也不变）；只有调用方显式传了 headers 时才在后面追加。
+      const headers = {
+        host: url.host,
+        'user-agent': 'Mozilla/5.0',
+        accept: binary ? 'image/*,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'zh-CN,zh;q=0.9',
+      };
+      if (extraHeaders) Object.assign(headers, extraHeaders);
       req = mod.request({
-        hostname: ip,
+        // 连接到已校验的 IP：Host/SNI 仍是原域名，地址判定不能被 DNS rebinding 绕过。
+        // IPv6 字面量自带方括号，mod.request 的 host 参数接受不带括号的形式。
+        hostname: address,
+        servername: net.isIP(url.hostname) ? undefined : hostname,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
-        path: url.pathname + url.search,
+        path: `${url.pathname}${url.search}`,
         method: 'GET',
         headers,
-        servername: url.protocol === 'https:' && !net.isIP(hostname) ? hostname : undefined,
-        rejectUnauthorized: url.protocol === 'https:',
-        timeout: REQUEST_TIMEOUT_MS,
+        timeout: budgetMs,
+        rejectUnauthorized: true,
       }, (res) => {
         response = res;
-        res.on('error', (error) => finish(error));
-        res.on('aborted', () => finish(new Error('响应体读取中断')));
-        res.on('close', () => {
-          if (!res.complete) finish(new Error('响应体读取中断'));
-        });
-        if (settled) { res.destroy(); return; }
         const statusCode = res.statusCode || 0;
-        if (REDIRECT_STATUSES.has(statusCode)) {
-          finish(null, { statusCode, redirect: String(res.headers.location || '') });
-          // 不下载重定向正文：攻击者可以发送无限正文消耗连接和带宽。
+        // 3xx：不下载重定向正文：攻击者可以发送无限正文消耗连接和带宽。
+        if ([301, 302, 303, 307, 308].includes(statusCode)) {
           res.destroy();
+          finish(null, { statusCode, redirect: res.headers.location || '' });
           return;
         }
-        const chunks = [];
-        const decoder = binary ? null : new StringDecoder('utf8');
-        let size = 0;
-        const appendText = (text) => {
-          const points = Array.from(text);
-          const remaining = limit - size;
-          chunks.push(points.slice(0, remaining).join(''));
-          size += Math.min(points.length, remaining);
-          if (size >= limit) {
-            finish(null, { statusCode, body: chunks.join(''), truncated: true });
-            res.destroy();
-          }
-        };
-        res.on('data', (chunk) => {
-          if (settled) return;
-          if (!binary) { appendText(decoder.write(chunk)); return; }
-          size += chunk.length;
-          if (size > limit) {
-            finish(new Error(`图片超过大小限制（${limit} 字节）`));
-            res.destroy();
-            return;
-          }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          if (settled) return;
-          if (binary) finish(null, { statusCode, buffer: Buffer.concat(chunks) });
-          else {
+        if (binary) {
+          const chunks = [];
+          let size = 0;
+          res.on('data', (chunk) => {
+            if (settled) return;
+            size += chunk.length;
+            if (size > limit) {
+              finishPolicy(new Error(`图片超过大小限制（${limit} 字节）`));
+              res.destroy();
+              return;
+            }
+            chunks.push(chunk);
+          });
+          res.on('end', () => {
+            if (settled) return;
+            finish(null, { statusCode, buffer: Buffer.concat(chunks) });
+          });
+        } else {
+          const decoder = new StringDecoder('utf8');
+          const chunks = [];
+          let size = 0;
+          const appendText = (text) => {
+            const points = Array.from(text);
+            const remaining = limit - size;
+            // 截断用码点切，避免把 emoji 的代理对从中间劈开（与 md-to-plain 的约定一致）。
+            if (points.length > remaining) {
+              chunks.push(points.slice(0, Math.max(remaining, 0)).join(''));
+              size = limit;
+            } else {
+              chunks.push(text);
+              size += points.length;
+            }
+          };
+          res.on('data', (chunk) => {
+            if (settled) return;
+            appendText(decoder.write(chunk));
+          });
+          res.on('end', () => {
+            if (settled) return;
             appendText(decoder.end());
-            finish(null, { statusCode, body: chunks.join(''), truncated: false });
-          }
+            finish(null, { statusCode, body: chunks.join(''), truncated: size >= limit });
+          });
+        }
+        res.on('error', (error) => finish(error));
+        res.on('aborted', () => finish(new Error('连接中断')));
+        res.on('close', () => {
+          if (!res.complete) finish(new Error('连接中断'));
         });
       });
       req.on('timeout', () => {
@@ -380,6 +414,28 @@ function requestOnce(url, ip, limit, binary = false, extraHeaders = null) {
   });
 }
 
+async function requestOnce(url, addresses, limit, binary = false, extraHeaders = null) {
+  const list = (Array.isArray(addresses) ? addresses : [addresses]).filter(Boolean);
+  if (!list.length) throw new Error(`没有可用地址：${url.hostname}`);
+  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+  const attempts = Math.min(list.length, MAX_ADDRESS_ATTEMPTS);
+  let lastError = null;
+  for (let i = 0; i < attempts; i += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 250) break;
+    const budget = list.length === 1 ? REQUEST_TIMEOUT_MS : Math.min(ATTEMPT_TIMEOUT_MS, remaining);
+    const outcome = await attemptOnce(url, list[i], limit, binary, budget, extraHeaders);
+    if (outcome.ok) return outcome.result;
+    lastError = outcome.error;
+    if (!outcome.retryable) throw outcome.error;
+    if (i < attempts - 1) {
+      // 换地址重试：只换连接目标，Host/SNI/路径全部不变（同一个站点）。
+      await new Promise((r) => setTimeout(r, 50 + i * 100));
+    }
+  }
+  throw lastError ?? new Error(`请求超时：${url.hostname}`);
+}
+
 /**
  * 读取一个 URL 并返回正文。
  *
@@ -395,14 +451,14 @@ export async function safeFetch(urlString, maxChars = 50000, opts = {}) {
   validateLimit(maxChars, 'maxChars');
   const MAX_REDIRECTS = 5;
   let extraHeaders = normalizeHeaderOverrides(opts?.headers);
-  let { url, ip } = await resolveTarget(urlString, opts?.allowHost, opts?.allowPorts);
+  let { url, addresses } = await resolveTarget(urlString, opts?.allowHost, opts?.allowPorts);
   const origin = url.origin;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, ip, maxChars, false, extraHeaders);
+    const result = await requestOnce(url, addresses, maxChars, false, extraHeaders);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, ip } = await resolveTarget(next, opts?.allowHost, opts?.allowPorts));
+      ({ url, addresses } = await resolveTarget(next, opts?.allowHost, opts?.allowPorts));
       if (url.origin !== origin) extraHeaders = null;
       continue;
     }
@@ -446,14 +502,14 @@ export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024, opt
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let extraHeaders = normalizeHeaderOverrides(opts?.headers);
-  let { url, ip } = await resolveTarget(urlString, opts?.allowHost, opts?.allowPorts);
+  let { url, addresses } = await resolveTarget(urlString, opts?.allowHost, opts?.allowPorts);
   const origin = url.origin;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, ip, maxBytes, true, extraHeaders);
+    const result = await requestOnce(url, addresses, maxBytes, true, extraHeaders);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, ip } = await resolveTarget(next, opts?.allowHost, opts?.allowPorts));
+      ({ url, addresses } = await resolveTarget(next, opts?.allowHost, opts?.allowPorts));
       if (url.origin !== origin) extraHeaders = null;
       continue;
     }
