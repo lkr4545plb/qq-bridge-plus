@@ -41,12 +41,18 @@ export function isBridgeCommandLine(commandLine) {
   return /(^|[\\/])bridge\.js$/i.test(nodeScript(commandLine));
 }
 
-export function isBridgeProcess(proc, root = DEFAULT_ROOT) {
+export function isBridgeProcess(proc, root = DEFAULT_ROOT, { allowRelative = false } = {}) {
   if (!proc) return false;
   const name = String(proc.name ?? '').toLowerCase();
   if (name !== 'node.exe' && name !== 'node') return false;
   const script = nodeScript(proc.commandLine);
-  if (!/(^|[\\/])bridge\.js$/i.test(script) || !path.isAbsolute(script)) return false;
+  if (!/(^|[\\/])bridge\.js$/i.test(script)) return false;
+  if (!path.isAbsolute(script)) {
+    // 2026-11-10 事故：旧 start.bat 用相对入口（node src/bridge.js）启动，绝对路径校验
+    // 一律失败 → restart.bat 拒绝停止 → 老代码一直被当成"已重启"继续跑。
+    // 只有调用方拿到**端口归属证明**（控制台端口监听者 === 锁 PID）时，才接受相对入口。
+    return allowRelative && /^(?:\.\.?[\\/])?src[\\/]bridge\.js$/i.test(script);
+  }
   return samePath(script, path.join(root, 'src', 'bridge.js'));
 }
 
@@ -75,7 +81,9 @@ export function isGuardProcess(proc, root) {
  */
 export function planStop({ port, root = DEFAULT_ROOT, lockPid = null, processes = [], listenerPid = null }) {
   const lockProcess = lockPid == null ? null : processes.find((p) => p && p.pid === lockPid) ?? null;
-  const verified = isBridgeProcess(lockProcess, root);
+  // 端口监听者与锁 PID 一致 = 归属强证据；此时才允许相对入口通过校验（见 isBridgeProcess）。
+  const portProvesOwnership = listenerPid != null && lockPid != null && listenerPid === lockPid;
+  const verified = isBridgeProcess(lockProcess, root, { allowRelative: portProvesOwnership });
 
   // 端口是最强的“这里确实有一个实例”的证据。只要它不是锁里那个已验证的 PID，
   // 就说明要么是本项目实例但锁已丢失（无法证明归属），要么端口被别的程序占了 —— 两种都不该杀。

@@ -881,6 +881,8 @@ let stateDirHardened = null;
 
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
+  // 启动标记：确认"到底跑的是哪份代码"（旧实例残留时这一行就是第一证据）。
+  log(`[binding] 会话绑定：sessionId 形如 qqb-<g|p>-<id>-<32hex>；守卫严格模式由 QQ_BRIDGE_ENFORCE_SELF_KEY=1 开启`);
   const cfg = loadConfig();
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();

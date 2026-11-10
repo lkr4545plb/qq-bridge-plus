@@ -1,5 +1,11 @@
 import { sessionBindingDenial, trustedSelfKeyOf } from './qq-self-key.mjs'
 
+// 执行期会话绑定的开关（2026-11-10 第二次事故后改为**默认关闭**）：
+// 两次事故都发生在「守卫比桥接更"新"」的窗口里（编码宽度漂移、旧会话未迁移），
+// 结果是群聊里全部带 key 的工具被统一拒死。默认关闭 = 即使绑定实现再出错，也只会
+// 留下诊断日志，不会让机器人失联；确认部署稳定后用环境变量打开严格模式。
+const ENFORCE_SELF_KEY = process.env.QQ_BRIDGE_ENFORCE_SELF_KEY === '1'
+
 // QQ 桥接安全边界：默认只允许 QQ MCP 工具与无害模型侧工具；
 // 2026-11-10 起按操作者要求**开放本地命令与文件读写**（bash/pwsh/read/read_image/
 // write/edit/str_replace_editor/glob/grep）——只开这 9 个，派生 agent、插件装载、
@@ -309,7 +315,7 @@ export function apply(ctx) {
       // 会话绑定（2026-11-10，上游 040f159）：凡带 key 的 QQ MCP 工具都必须是**当前会话**。
       // 判据是「参数表声明了 key」（工具身份），不是运行时 arguments（模型可控）。
       // 未绑定会话（解不出身份）同样拒绝 —— 放行它等于给出跨会话读取的后门。
-      if (String(name).startsWith('mcp__snowluma__')) {
+      if (ENFORCE_SELF_KEY && String(name).startsWith('mcp__snowluma__')) {
         // 自愈降级（2026-11-10 事故后）：解不出可信身份时**放行并留诊断日志**，而不是把
         // 全部 QQ 工具拒死 —— 曾因编码宽度不一致（8 hex vs 32 hex）导致整机 20 分钟不可用。
         // 能解出身份时仍严格比对：跨会话调用继续以统一文案拒绝。

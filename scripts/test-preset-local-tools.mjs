@@ -313,7 +313,13 @@ test('session binding: encode/decode round-trip and safe degradation', async () 
     assert.equal(guard(exec), undefined, `无法解码身份时不得拒死（${exec.agent.id || '空 id'}）`);
   }
 
-  // ④ 桥接侧编码宽度必须与解码器一致（防再次漂移）。
+  // ④ 守卫默认**不启用**严格绑定（2026-11-10 二次事故后）：只有显式设置
+  //    QQ_BRIDGE_ENFORCE_SELF_KEY=1 才启用；否则解不出身份也不会拒死。
+  const guardSrc = fs.readFileSync(path.join(ROOT, 'plugins/qq-agent-presets/qq-tool-restrict.mjs'), 'utf8');
+  assert.match(guardSrc, /QQ_BRIDGE_ENFORCE_SELF_KEY === '1'/, '守卫必须保留 env 严格模式开关');
+  assert.ok(!/if \(String\(name\)\.startsWith\('mcp__snowluma__'\)\) \{/.test(guardSrc), '绑定校验不得无条件生效');
+
+  // ⑤ 桥接侧编码宽度必须与解码器一致（防再次漂移）。
   const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
   assert.match(bridgeSrc, /crypto\.randomBytes\(16\)\.toString\('hex'\)/, 'bridge encodeSelfKey 必须用 randomBytes(16)');
   assert.match(bridgeSrc, /\^qqb-\[gp\]-\\d\{1,20\}-\[0-9a-f\]\{32\}\$/, 'BOUND_SESSION_ID_RE 必须是 32 hex');
