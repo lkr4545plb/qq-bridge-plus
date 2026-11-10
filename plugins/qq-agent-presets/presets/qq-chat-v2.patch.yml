@@ -48,8 +48,6 @@
             name: '@deepseek-ai/dsh-tool-todo'
             config:
               allowParallelInProgress: true
-          - id: shell-env
-            name: '@deepseek-ai/dsh-shell-env'
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
           - id: tool-fs
@@ -58,10 +56,6 @@
             name: '@deepseek-ai/dsh-tool-fs-search'
             config:
               sampleOverCapGlobResults: false
-          - id: permission
-            name: '@deepseek-ai/dsh-permission-presets'
-            config:
-              defaultPreset: danger-full-access
           - id: qq-tool-restrict
             name: qq-agent-presets/qq-tool-restrict.mjs
             config: {}

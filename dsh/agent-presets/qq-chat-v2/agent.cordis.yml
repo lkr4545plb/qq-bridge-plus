@@ -174,12 +174,9 @@
 # ── 本地工具（2026-11-10 按操作者要求开放：跑命令、写代码）────────────────────
 # 守卫（qq-tool-restrict）已放行这些工具；这里负责真正挂载 —— 之前只改了守卫、
 # 没挂载，模型自然看不到 bash/read/write。
-- id: shell-env
-  name: '@deepseek-ai/dsh-shell-env'
-
 - id: tool-bash
   name: '@deepseek-ai/dsh-tool-bash'
-# Windows 部署：把上两行换成
+# Windows 部署：把上面一行换成
 # - id: tool-pwsh
 #   name: '@deepseek-ai/dsh-tool-pwsh'
 
@@ -190,13 +187,6 @@
   name: '@deepseek-ai/dsh-tool-fs-search'
   config:
     sampleOverCapGlobResults: false
-
-# 无头 QQ 会话没有人工审批：本地命令必须永远不弹审批（danger-full-access + never），
-# 否则 bash 调用会挂在 approval 上无人应答。
-- id: permission
-  name: '@deepseek-ai/dsh-permission-presets'
-  config:
-    defaultPreset: danger-full-access
 
 # ── QQ 安全硬边界 ────────────────────────────────────────────────────────────
 # 隐藏开发/管理工具，并在执行期用白名单拒绝任何越权工具调用。
