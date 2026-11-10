@@ -69,6 +69,8 @@ test-md / test-forward / test-audit-security / test-audit-security-mcp / test-mc
 token-economy 全绿（改动后无回归，已用 stash 做过基线对比）。
 
 ### 产品需求（非上游项，2026-11-10）
+- ✅ **收尾潜水松绑**（commit 7f5d030）：qq_mark_read 直接回潜水（删除观察门禁）；
+  沉睡前观察窗口 5 分钟 → 2 分钟（wake-policy/runtime-config/提示词/工具描述全同步）
 - ✅ **qq_set_effort 权限开放**（commit 4fbc07f）：agent 可改自己会话的思考强度覆盖，
   全局仍属管理员；控制台工具开关可关；v2 提示词已补说明
 
