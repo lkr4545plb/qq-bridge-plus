@@ -68,6 +68,10 @@ test-dsh-cli-resolve、test-dsh-discovery-logging）；test-quick 64/66（同两
 test-md / test-forward / test-audit-security / test-audit-security-mcp / test-mcp-web-search /
 token-economy 全绿（改动后无回归，已用 stash 做过基线对比）。
 
+### 产品需求（非上游项，2026-11-10）
+- ✅ **qq_set_effort 权限开放**（commit 4fbc07f）：agent 可改自己会话的思考强度覆盖，
+  全局仍属管理员；控制台工具开关可关；v2 提示词已补说明
+
 ### 批次 2 进度
 
 #### 已完成
