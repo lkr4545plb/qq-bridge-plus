@@ -861,6 +861,9 @@ function canonicalV2Key(key) {
 // qq-tool-restrict 守卫从 exec.agent.id 解出可信身份，凡带 `key` 的 QQ 工具调用都必须
 // 指向它自己 —— 模型/注入文本改不了这个值。
 const BOUND_SESSION_ID_RE = /^qqb-[gp]-\d{1,20}-[0-9a-f]{32}$/;
+// 与 qq-tool-restrict 的守卫同一开关：默认关闭，只有 QQ_BRIDGE_ENFORCE_SELF_KEY=1 才
+// 做严格绑定（含把旧形态 session-* 退役重建）。
+const ENFORCE_SELF_KEY_BINDING = process.env.QQ_BRIDGE_ENFORCE_SELF_KEY === '1';
 function encodeSelfKey(key) {
   const m = /^(group|private):(\d{1,20})$/.exec(String(key ?? '').trim());
   if (!m) return '';
@@ -10670,7 +10673,9 @@ async function main() {
     // 升级兼容（上游 040f159）：旧版本建的会话 id 由 DSH 自生成（session-…），解不出 QQ
     // 会话 key，新的执行期闸门会把这类会话的全部带 key 工具调用拒掉（表现为「机器人突然
     // 不能用任何 QQ 工具」）。这里一次性退役重建；历史仍留在 DSH 里，不会丢。
-    if (existingRaw && !BOUND_SESSION_ID_RE.test(String(existingRaw))) {
+    // 只有开启严格会话绑定时才把旧形态会话退役重建（见 QQ_BRIDGE_ENFORCE_SELF_KEY）：
+    // 默认关闭时保持既有会话不动，避免为了"绑定"把可继续的上下文归档（2026-11-10 事故）。
+    if (ENFORCE_SELF_KEY_BINDING && existingRaw && !BOUND_SESSION_ID_RE.test(String(existingRaw))) {
       log(`会话 ${key} 的 id 不是执行期绑定形态（${existingRaw}），退役并按新规则重建`);
       retireSession(key);
     }

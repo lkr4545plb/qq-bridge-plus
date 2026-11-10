@@ -223,6 +223,8 @@ const METHOD_ARG_WRAPPERS = {
   'workspace/rename': 'request',
   'workspace/delete': 'request',
   'workspace/archiveSession': 'request',
+  // 归档可逆（2026-11-10）：误归档/绑定迁移后恢复会话要用；DSH 0.2.x 已提供该 RPC。
+  'workspace/unarchiveSession': 'request',
   'workspace/insertBefore': 'request',
   'workspace/insertSessionBefore': 'request',
   'agentPresets/list': null,
