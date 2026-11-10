@@ -151,6 +151,20 @@ export function icacls(args, timeout = 30000) {
  * 必须排除 Mandatory Label 行：那不是权限，而且 DSH 沙箱打过 Low 标签后它永远带 (I)。
  * 用全文 `/\(I\)/` 扫描会把「已收紧」判成「未收紧」，进而让调用方反复重跑破坏性命令。
  */
+/**
+ * 空 DACL/仅完整性标签不属于「已收紧」：至少要存在一条**实际 allow 权限**。
+ * 纯函数，与 hasInheritedPermissionAce/hasPermissiveTrustee 互补（上游 24e29ba/d7fae44 的吸收项）。
+ */
+export function hasPermissionGrant(icaclsOutput) {
+  return String(icaclsOutput ?? '').split(/\r?\n/).some((line) => {
+    if (/Mandatory Label|\(DENY\)/i.test(line)) return false;
+    // 必须是 trustee 冒号后的 ACE，路径名里的「(F)」不是授权。
+    const ace = /:((?:\((?:I|OI|CI|IO|NP)\))*)\((?:F|M|RX|R|W|D|RC|WDAC|WO|RD|WD|AD|REA|WEA|X|DC|RA|WA)(?:,[A-Z]+)*\)/.exec(line);
+    // (IO) 只对子项生效，不能证明当前目录/文件自己仍有可用权限。
+    return ace !== null && !ace[1].includes('(IO)');
+  });
+}
+
 export function hasInheritedPermissionAce(icaclsOutput) {
   return String(icaclsOutput ?? '')
     .split(/\r?\n/)
@@ -250,7 +264,7 @@ export function isHardened(target, { platform = process.platform, runIcacls = ic
   const cls = classifyIcaclsOutput(res);
   if (!cls.ok) return false;
   const out = `${res.stdout ?? ''}${res.stderr ?? ''}`;
-  return !hasInheritedPermissionAce(out) && !hasPermissiveTrustee(out);
+  return !hasInheritedPermissionAce(out) && !hasPermissiveTrustee(out) && hasPermissionGrant(out);
 }
 
 /**

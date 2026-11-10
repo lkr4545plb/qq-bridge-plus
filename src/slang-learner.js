@@ -47,6 +47,36 @@ const SLANG_FIELD_MAX = 300;
 const SLANG_CONTENT_MAX = 50;
 const EVIDENCE_TEXT_MAX = 80;
 
+// ── 会话隔离（2026-11-10，上游 4de160b）─────────────────────────────────────
+//
+// 为什么需要：黑话/含义/证据是 AI 在**某个群**里学到的，原来 buildSlangContext()
+// 把它们逐字注入**每一个会话**。A 群里学到的内部梗与证据（群号、人名、话题）出现在
+// B 群的提示词里，就是一条跨会话信息流。归属按写它的会话记；`global` = 公开可见
+// （人工确认/控制台新建默认走 global，保持既有语义）。
+const SCOPE_QUARANTINE = 'quarantine:';
+const QUARANTINED_SCOPE_MAX = 80;
+
+/** 黑话归属的规范形式：`group:123` / `private:456`；非法值进隔离前缀（任何会话都不可见）。 */
+export function normalizeSlangScope(value) {
+  const s = String(value ?? '').trim();
+  if (!s || s === 'global') return 'global';
+  if (s.startsWith(SCOPE_QUARANTINE)) return s.slice(0, QUARANTINED_SCOPE_MAX);
+  const m = /^(group|private):(\d{1,20})$/.exec(s);
+  const id = m ? Number(m[2]) : 0;
+  if (m && Number.isSafeInteger(id) && id > 0) return `${m[1]}:${id}`;
+  return `${SCOPE_QUARANTINE}${s.slice(0, 40)}`;
+}
+
+/** 某条黑话是否应当在 `currentKey` 这个会话里可见。 */
+export function slangScopeVisible(scope, currentKey) {
+  const s = normalizeSlangScope(scope);
+  if (s === 'global') return true;
+  // 隔离中的归属对任何会话都不可见（包括没有 currentKey 的调用）。
+  if (s.startsWith(SCOPE_QUARANTINE)) return false;
+  if (!currentKey) return false;
+  return s === normalizeSlangScope(currentKey);
+}
+
 export function normalizeSlangEntry(raw) {
   const entry = raw && typeof raw === 'object' ? raw : {};
   const status = [SLANG_STATUS.CANDIDATE, SLANG_STATUS.CONFIRMED, SLANG_STATUS.REJECTED].includes(entry.status)
@@ -80,6 +110,8 @@ export function normalizeSlangEntry(raw) {
     // 编辑/批量确认/批量拒绝），自动抽取/再见到一次不会碰它。老条目没有这个字段 ⇒ 空串 ⇒
     // 排序时回退 updatedAt（保持 t35/t36 的既有语义与既有验证脚本兼容）。
     lastReviewedAt: String(entry.lastReviewedAt || ''),
+    // 归属会话（迁移默认 global：旧库条目保持对所有会话可见，不改变既有行为）。
+    scope: normalizeSlangScope(entry.scope),
   };
 }
 
@@ -166,8 +198,9 @@ export function saveSlang(file, entries, { max = SLANG_MAX_ENTRIES } = {}) {
   return { entries: capped, dropped };
 }
 
-export function createSlangEntry({ content, meaning = '', usage = '', example = '', risk = '', sources = [], status = SLANG_STATUS.CANDIDATE, source = 'ai', evidence = [] } = {}) {
+export function createSlangEntry({ content, meaning = '', usage = '', example = '', risk = '', sources = [], status = SLANG_STATUS.CANDIDATE, source = 'ai', evidence = [], scope = 'global' } = {}) {
   return normalizeSlangEntry({
+    scope,
     content,
     meaning,
     usage,
@@ -325,8 +358,11 @@ export function selectSlangForPrompt(entries, { max = 8, reserve = 0 } = {}) {
   return picked.slice(0, limit);
 }
 
-export function buildSlangContext(entries, max = 8, { reserve = 0 } = {}) {
-  const confirmed = selectSlangForPrompt(entries, { max, reserve });
+export function buildSlangContext(entries, max = 8, { reserve = 0, currentKey = '' } = {}) {
+  // 只给本会话看得到的那部分参与选择（global + 本会话归属）。
+  const scoped = (Array.isArray(entries) ? entries : []).filter((e) => slangScopeVisible(e.scope, currentKey));
+  const hidden = (Array.isArray(entries) ? entries.length : 0) - scoped.length;
+  const confirmed = selectSlangForPrompt(scoped, { max, reserve });
   if (!confirmed.length) return '';
   const lines = confirmed.map((e) => {
     const clean = (s) => escapeLearnerText(String(s ?? '').replace(/\[CQ:/gi, '[CQ：'));
@@ -335,7 +371,8 @@ export function buildSlangContext(entries, max = 8, { reserve = 0 } = {}) {
     if (e.example) line += `（例：${clean(e.example)}）`;
     return line;
   });
-  return `【群聊黑话表】群里已确认/常用的网络用语和梗（最近确认的排在前，其余按出现次数；知道即可，不要刻意堆砌）：\n${lines.join('\n')}`;
+  const footer = hidden > 0 ? `（另有 ${hidden} 条属于其他会话，未列出）` : '';
+  return `【群聊黑话表】群里已确认/常用的网络用语和梗（最近确认的排在前，其余按出现次数；知道即可，不要刻意堆砌）：\n${lines.join('\n')}${footer ? `\n${footer}` : ''}`;
 }
 
 export function buildExtractionPrompt(messages) {

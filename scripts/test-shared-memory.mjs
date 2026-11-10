@@ -11,6 +11,7 @@
 // 覆盖：t5(P1-P5)/t3(F1-F7) 的一轮加固 + t7 二轮审计 R1-R7（uid 主键、跨来源改删归属、
 // agent 侧元数据剥离、管理端正向标记、allSessions 归属、原型键统一过滤、共享段独立块渲染）。
 import fs from 'node:fs';
+import { sanitizeUntrustedText } from '../src/qq-model-view.js';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -85,7 +86,7 @@ function loadPatch({ cfg = {}, conversations = new Map(), sharedMemory = null, s
   const atomicStub = (file, obj) => fs.writeFileSync(file, JSON.stringify(obj));
   const readStub = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } };
   const factory = new Function(
-    'cfg', 'socialV2', 'log', 'redactKnownTokensOnly', 'truncateText', 'saveSocialV2State',
+    'cfg', 'socialV2', 'log', 'redactKnownTokensOnly', 'truncateText', 'sanitizeUntrustedText', 'saveSocialV2State',
     'fs', 'path', 'STATE_DIR', 'atomicWriteJson', 'readJsonSafe', 'memoryText',
     'normalizeMemoryInjectConfig', 'planMemoryInject', 'clipTraits',
     `${MEMORY_TEXT_INJECTION}
@@ -98,6 +99,7 @@ ${block}
     (m) => logs.push(String(m)),
     (t) => String(t ?? ''),
     (s, n) => String(s ?? '').slice(0, n),
+    sanitizeUntrustedText,
     () => saves.push(Date.now()),
     fs, path, scratch, atomicStub, readStub, memoryText,
     normalizeMemoryInjectConfig, planMemoryInject, clipTraits
@@ -363,7 +365,7 @@ const groupWithRoster = (over = {}) => st({
     };
     const logs = [];
     const factory = new Function(
-      'cfg', 'socialV2', 'log', 'redactKnownTokensOnly', 'truncateText', 'saveSocialV2State',
+      'cfg', 'socialV2', 'log', 'redactKnownTokensOnly', 'truncateText', 'sanitizeUntrustedText', 'saveSocialV2State',
       'fs', 'path', 'STATE_DIR', 'atomicWriteJson', 'readJsonSafe', 'memoryText',
       `${MEMORY_TEXT_INJECTION}
 ${block}
@@ -371,7 +373,7 @@ ${block}
     );
     const api = factory(
       { ownerQQ: 1000000001, socialV2: {} }, socialV2, (m) => logs.push(String(m)),
-      (t) => String(t ?? ''), (s, n) => String(s ?? '').slice(0, n), () => {},
+      (t) => String(t ?? ''), (s, n) => String(s ?? '').slice(0, n), sanitizeUntrustedText, () => {},
       fsOverride || fs, path, stateDir, atomicStub, readStub, memoryText
     );
     return { api, socialV2, logs };
@@ -467,13 +469,13 @@ ${block}
     const socialV2 = { paused: false, conversations: new Map([['group:1', st({ activeTopics: [{ text: 'x', lastMentionAt: Date.now() }] })]]), sharedMemory: { activeTopics: [], memberImpressions: {}, confirmedTargets: [], migratedAt: 0 } };
     const logs = [];
     const factory = new Function(
-      'cfg', 'socialV2', 'log', 'redactKnownTokensOnly', 'truncateText', 'saveSocialV2State',
+      'cfg', 'socialV2', 'log', 'redactKnownTokensOnly', 'truncateText', 'sanitizeUntrustedText', 'saveSocialV2State',
       'fs', 'path', 'STATE_DIR', 'atomicWriteJson', 'readJsonSafe', 'memoryText',
       `${MEMORY_TEXT_INJECTION}
 ${block}
  return { memorySnapshotStampV2, manualSnapshotFileNameV2, uniqueSnapshotFileNameV2, isSafeSnapshotFileNameV2, writeMemorySnapshotV2, ensureDailyMemorySnapshotV2, listMemorySnapshotsV2, rollbackMemoryFromSnapshotV2, MEMORY_SNAPSHOT_FAIL_LOG_V2 };`
     );
-    const api = factory({ ownerQQ: 1000000001, socialV2: {} }, socialV2, (m) => logs.push(String(m)), (t) => String(t ?? ''), (s, n) => String(s ?? '').slice(0, n), () => {},
+    const api = factory({ ownerQQ: 1000000001, socialV2: {} }, socialV2, (m) => logs.push(String(m)), (t) => String(t ?? ''), (s, n) => String(s ?? '').slice(0, n), sanitizeUntrustedText, () => {},
       fsOverride || fs, path, stateDir12, atomicStub, readStub, memoryText);
     return { api, socialV2, logs };
   };

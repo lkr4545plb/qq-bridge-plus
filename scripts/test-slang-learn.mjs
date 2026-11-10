@@ -63,3 +63,18 @@ function ok(name) {
 }
 
 console.log(`\n🎉 黑话学习新增逻辑测试通过（${passed} 项）`);
+
+// 6. 黑话按会话隔离（2026-11-10，上游 4de160b）
+{
+  const entries = [
+    { content: 'yyds', meaning: '永远的神', status: 'confirmed', count: 5, scope: 'global' },
+    { content: '群梗A', meaning: 'A群内部梗', status: 'confirmed', count: 5, scope: 'group:100001' },
+    { content: '群梗B', meaning: 'B群内部梗', status: 'confirmed', count: 5, scope: 'group:100002' },
+  ];
+  const ctxA = buildSlangContext(entries, 8, { currentKey: 'group:100001' });
+  ok(ctxA.includes('yyds') && ctxA.includes('群梗A'), 'A 群能看到 global 与本群黑话');
+  ok(!ctxA.includes('群梗B'), 'A 群看不到 B 群黑话');
+  ok(ctxA.includes('另有 1 条属于其他会话'), '被隔离的条数必须明说');
+  const ctxB = buildSlangContext(entries, 8, { currentKey: 'group:100002' });
+  ok(ctxB.includes('群梗B') && !ctxB.includes('群梗A'), 'B 群只看到自己的');
+}

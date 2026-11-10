@@ -42,7 +42,7 @@ import { classifyAgentError, defaultErrorNoticeGate, createErrorNoticeGate } fro
 import { createRetryObserver, retryHttpStatus } from './retry-observer.js';
 import { formatRetryDiagnostic } from './retry-diagnostic.js';
 import { looksLikeUnfinished } from './v2-wait.js';
-import { compactModelMessage } from './qq-model-view.js';
+import { compactModelMessage, sanitizeUntrustedText } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { transcribeLocally } from './local-asr.mjs';
 import { TTS_DEFAULT_VOICE, TTS_VOICE_PRESETS, describeVoicePresets, normalizePitchArg, normalizePercentArg, normalizeTtsVoice } from './core/tts-voices.mjs';
@@ -724,7 +724,9 @@ function log(...args) {
   try { console.log(line); } catch {}
   appendBridgeLog(`${line}\n`);
 }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 延迟钳制（上游 6ccee53）：负数/NaN 归零，超过 Node 的 2^31-1 上限会被 setTimeout 当成 1ms 立即执行 ——
+// 统一压到 24h 以内，避免「本该睡很久」变成忙循环。
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.min(86400000, Math.max(0, Number(ms) || 0))));
 const convKey = (kind, id) => `${kind}:${id}`;
 const SEND_TIMEOUT_MS = 15000;
 function withTimeout(promise, ms, label) {
@@ -1851,8 +1853,10 @@ async function main() {
   }
 
   // 更新本地 AI 认知（含义/标签/用法）。
-  function applyStickerNoteV2(stickerId, note, tags, usage) {
+  function applyStickerNoteV2(stickerId, note, tags, usage, currentKey = '') {
     const patch = {};
+    // 备注归属到写它的那个会话：备注内容常带群号/人名/话题，不该出现在别的会话的提示词里。
+    if (currentKey) patch.noteScope = canonicalV2Key(currentKey) || 'global';
     if (note !== undefined && note !== null) patch.note = String(note);
     if (tags !== undefined && tags !== null) patch.tags = Array.isArray(tags) ? tags.map(String) : String(tags).split(/[,，\s]+/);
     if (usage !== undefined && usage !== null) patch.usage = String(usage);
@@ -2056,7 +2060,7 @@ async function main() {
         const idx = Number(item.source_id) - 1;
         const src = Number.isInteger(idx) && idx >= 0 && idx < messages.length ? messages[idx] : null;
         const evidence = src ? [{ key, sender: src.sender, text: src.text, time: src.time }] : [];
-        const result = upsertSlangEntry(slangEntries, item.content, { evidence, countIncrement: 1 });
+        const result = upsertSlangEntry(slangEntries, item.content, { evidence, countIncrement: 1, scope: canonicalV2Key(key) || 'global' });
         if (result.created) added += 1; else updated += 1;
         if (result.entry && result.entry.status === SLANG_STATUS.CANDIDATE && thresholds.includes(result.entry.count) && result.entry.count > result.entry.lastInferenceCount) {
           researchCandidates.push(result.entry);
@@ -2238,17 +2242,17 @@ async function main() {
   }
 
   /** 注入提示词里的黑话块（与 confirmedSlangListV2 共用同一个选择器 ⇒ 集合必然一致）。 */
-  function slangBlockV2() {
+  function slangBlockV2(currentKey = '') {
     const { max, reserve } = slangSelectionV2();
-    return buildSlangContext(slangEntries, max, { reserve });
+    return buildSlangContext(slangEntries, max, { reserve, currentKey });
   }
 
-  function withSlangContext(promptText) {
+  function withSlangContext(promptText, currentKey = '') {
     const now = new Date();
     const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
     const parts = [timeLine];
     if (cfg.slang?.enabled !== false) {
-      const block = slangBlockV2();
+      const block = slangBlockV2(currentKey);
       if (block) parts.push(block);
     }
     return parts.join('\n\n') + '\n\n' + promptText;
@@ -6820,7 +6824,7 @@ async function main() {
             stickers: {
               enabled: cfg.socialV2?.sticker?.enabled !== false,
               total: stickerEntries.length,
-              context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8) : '',
+              context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8, key) : '',
               strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
             },
             // 语音库摘要：让 AI 一开始就知道有哪些语音可发（真发之前用 qq_list_voices 看详情）。
@@ -7810,7 +7814,7 @@ async function main() {
           const note = body.note !== undefined && body.note !== null ? String(body.note).trim().slice(0, 200) : undefined;
           const tags = body.tags !== undefined && body.tags !== null ? (Array.isArray(body.tags) ? body.tags.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20) : []) : undefined;
           const usage = body.usage !== undefined && body.usage !== null ? String(body.usage).trim().slice(0, 200) : undefined;
-          const entry = applyStickerNoteV2(stickerId, note, tags, usage);
+          const entry = applyStickerNoteV2(stickerId, note, tags, usage, key);
           if (!entry) { sendJson({ ok: false, error: `找不到表情 ${stickerId}` }, 404); return; }
           log(`[sticker] 更新表情本地认知 ${key}: ${entry.id}`);
           sendJson({ ok: true, key, sticker: entry });
@@ -8602,7 +8606,15 @@ async function main() {
           // 同一会话只允许一个长轮询等待，避免并发挂起耗尽 HTTP handler。
           // 租约过期则视为残留（handler 异常退出没清干净），允许接管而不是永久 429。
           if (activeWaits.has(key) && Date.now() - activeWaits.get(key).startedAt < ACTIVE_WAIT_LEASE_MS) {
-            sendJson({ ok: false, error: '该会话已有一个等待中的 qq_wait_for_messages，请等待它结束' }, 429);
+            // 带上「还要等多久」和可执行动作：只说「请等待它结束」时，模型只会立刻重试，
+            // 十几分钟里把上下文空转烧掉（上游 2649f94 的吸收项）。
+            const waitUntil = activeWaits.get(key).startedAt + ACTIVE_WAIT_LEASE_MS;
+            sendJson({
+              ok: false,
+              error: '该会话已有一个等待中的 qq_wait_for_messages，请等待它结束；不要立刻重试（重试只会再拿到同样的拒绝）。',
+              retryAfterMs: Math.max(0, waitUntil - Date.now()),
+              hint: '若你只是要完成沉睡前观察：静候即可，观察窗口会随时间自然届满，不需要再发等待。'
+            }, 429);
             return;
           }
           const lease = { startedAt: Date.now() };
@@ -9608,6 +9620,7 @@ async function main() {
           const entry = createSlangEntry({
             content,
             source: 'ai',
+            scope: canonicalV2Key(key) || 'global',
             status: SLANG_STATUS.CANDIDATE,
             evidence: context ? [{ key, sender: 'AI提交', text: context.slice(0, 200), time: Date.now() }] : []
           });
@@ -11880,7 +11893,7 @@ async function main() {
         id: 'ownTopics', header: '【进行中的话题】', priority: 4, dropFrom: 'start',
         lines: ownTopics.map((t) => ({
           kind: 'topic',
-          text: `- ${t.text}${staleMark(t.lastMentionAt)}（${agoText(t.lastMentionAt)}）${t.pendingQuestion ? `；待追问：${t.pendingQuestion}` : ''}`,
+          text: `- ${sanitizeUntrustedText(t.text)}${staleMark(t.lastMentionAt)}（${agoText(t.lastMentionAt)}）${t.pendingQuestion ? `；待追问：${sanitizeUntrustedText(t.pendingQuestion)}` : ''}`,
         })),
       });
     }
@@ -11891,7 +11904,7 @@ async function main() {
         id: 'pendingThoughts', header: '【你想说但还没说的】', priority: 3, dropFrom: 'start',
         lines: thoughts.map((t) => ({
           kind: 'thought',
-          text: `- ${t.text}${t.motivation ? `（${t.motivation}）` : ''}`,
+          text: `- ${sanitizeUntrustedText(t.text)}${t.motivation ? `（${sanitizeUntrustedText(t.motivation)}）` : ''}`,
         })),
       });
     }
@@ -11904,7 +11917,7 @@ async function main() {
           const weak = im.weakened ? '（久未确认，已淡化）' : '';
           return {
             kind: 'impression',
-            text: `- ${impressionDisplayNameV2(entryKey, im)}：${traitsText(im, false)}（互动 ${Number(im.interactionCount) || 0} 次${seenText}）${weak}`,
+            text: `- ${sanitizeUntrustedText(impressionDisplayNameV2(entryKey, im))}：${sanitizeUntrustedText(traitsText(im, false))}（互动 ${Number(im.interactionCount) || 0} 次${seenText}）${weak}`,
           };
         }),
       });
@@ -12363,7 +12376,7 @@ async function main() {
 
   function buildContextBlock(key) {
     const ctx = (social.recentMessages.get(key) ?? []).slice(-Number(cfg.social?.contextWindow ?? 15));
-    return ctx.map((m) => `${m.isOwner ? '【管理员】' : ''}${m.sender}：${m.text}${mediaHintFor(key, m.messageId, m.media)}`).join('\n') || '（无）';
+    return ctx.map((m) => `${m.isOwner ? '【管理员】' : ''}${sanitizeUntrustedText(m.sender)}：${sanitizeUntrustedText(m.text)}${mediaHintFor(key, m.messageId, m.media)}`).join('\n') || '（无）';
   }
 
   // 触发进入活跃（启动阶段 → 活跃阶段）
@@ -12428,7 +12441,7 @@ async function main() {
   // 活跃阶段：只贴"没给过 AI 的新消息"（上下文在会话历史里，不重复贴，不贴人格）
   // allowSilent=false 表示这条必须回（被 @/点名/私聊等），不提供 [SILENT] 出口。
   function buildBatchPrompt(key, newMsgs, allowSilent = true) {
-    const lines = newMsgs.map((m) => `${m.isOwner ? '【管理员】' : ''}${m.sender}：${m.text}${mediaHintFor(key, m.messageId, m.media)}`).join('\n');
+    const lines = newMsgs.map((m) => `${m.isOwner ? '【管理员】' : ''}${sanitizeUntrustedText(m.sender)}：${sanitizeUntrustedText(m.text)}${mediaHintFor(key, m.messageId, m.media)}`).join('\n');
     const directionHint = lines.includes('[引用') ? `${DIRECTION_HINT}\n` : '';
     if (!allowSilent) {
       return `【新消息】\n${lines}\n\n${directionHint}请回复消息。\n${SPACE_SPLIT_HINT}`;
@@ -12538,10 +12551,10 @@ async function main() {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
       }
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: withSlangContext(promptText, key) }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = [{ type: 'text', text: withSlangContext(promptText, key) }, ...imageParts];
     }
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
@@ -12761,7 +12774,7 @@ async function main() {
     const targets = key ? (social.pendingSummaries.has(key) ? [[key, social.pendingSummaries.get(key)]] : []) : [...social.pendingSummaries.entries()];
     for (const [k, entry] of targets) {
       if (!entry.items.length) continue;
-      const lines = entry.items.map((m) => `${m.isOwner ? '【管理员】' : ''}${m.sender}：${m.text}${mediaHintFor(k, m.messageId, m.media)}`).join('\n');
+      const lines = entry.items.map((m) => `${m.isOwner ? '【管理员】' : ''}${sanitizeUntrustedText(m.sender)}：${sanitizeUntrustedText(m.text)}${mediaHintFor(k, m.messageId, m.media)}`).join('\n');
       const summaryMedia = entry.items.flatMap((m) => Array.isArray(m.media) ? m.media : []);
       let sessionId;
       try {
@@ -13478,7 +13491,7 @@ async function main() {
     // 否则模型不知道有哪些表情可发）。
     const stickerOn = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false;
     const stickerStrategyLine = stickerOn ? `${buildStickerStrategyHint()}\n` : '';
-    const stickerListLine = stickerOn ? `${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n` : '';
+    const stickerListLine = stickerOn ? `${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8, key)}\n\n` : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 120000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
     const replyTiming = replyTimingV2(st, key);
@@ -13491,7 +13504,7 @@ async function main() {
     const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
-    if (lastMsg) statusBits.push(`最近一条来自 ${String(lastMsg.sender || '未知')}：${String(lastMsg.text || lastMsg.plain || '').slice(0, 30)}`);
+    if (lastMsg) statusBits.push(`最近一条来自 ${sanitizeUntrustedText(lastMsg.sender || '未知')}：${sanitizeUntrustedText(String(lastMsg.text || lastMsg.plain || '')).slice(0, 30)}`);
     if (lastMsg && looksLikeUnfinished(String(lastMsg.tail || lastMsg.plain || lastMsg.text || ''))) statusBits.push('对方可能没说完');
     if (lastAiMin != null) statusBits.push(`你上次发言 ${lastAiMin} 分钟前`);
     const statusLine = `【此刻状态】${statusBits.join('；')}\n\n`;
@@ -14322,10 +14335,10 @@ async function main() {
       }
       throw error;
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: withSlangContext(promptText, key) }];
     if (Array.isArray(mediaList) && mediaList.length > 0) {
       const imageParts = await resolveMediaList(mediaList);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = [{ type: 'text', text: withSlangContext(promptText, key) }, ...imageParts];
     }
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     const accepted = await api.sessions.prompt({

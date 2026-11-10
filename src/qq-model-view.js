@@ -40,7 +40,23 @@ function compactMedia(media, canResolveByMessage) {
   });
 }
 
+/**
+ * 群友可控文本的**结构净化**（上游 1d6f889）：入模前把可以伪装成提示词结构的字符削掉。
+ *
+ * 为什么必须做：群消息、昵称、记忆条目都是「别人写的字」，原样进模型上下文时与系统提示词
+ * 同层 —— 一个 `【工具结果】`、换行开头的「忽略以上指令」就能伪造结构性边界。这里只做
+ * 结构层净化（全角方括号→半角、换行→空格、零宽字符剥离），不改语义、不截断内容。
+ */
+export function sanitizeUntrustedText(value) {
+  return String(value ?? '')
+    .replace(/\u3010/g, '[')
+    .replace(/\u3011/g, ']')
+    .replace(/[\r\n\u2028\u2029\u0085\u000b\u000c]+/g, ' ')
+    .replace(/[\u200b-\u200f\u2060\ufeff]/g, '');
+}
+
 export function compactModelMessage(message) {
+  if (typeof message === 'string') return sanitizeUntrustedText(message);
   if (!isRecord(message)) return message;
   const result = { ...message };
   // No trimming or truncation: differing plain text can contain resolved quote
@@ -48,6 +64,7 @@ export function compactModelMessage(message) {
   const seenText = new Set();
   for (const key of ['text', 'plain', 'tail']) {
     if (typeof result[key] !== 'string') continue;
+    result[key] = sanitizeUntrustedText(result[key]);
     if (seenText.has(result[key])) delete result[key];
     else seenText.add(result[key]);
   }
@@ -65,6 +82,7 @@ export function compactModelMessage(message) {
 }
 
 export function compactModelData(data) {
+  if (typeof data === 'string') return sanitizeUntrustedText(data);
   if (Array.isArray(data)) return data.map(compactModelData);
   if (!isRecord(data)) return data;
   return Object.fromEntries(Object.entries(data).map(([key, value]) => [

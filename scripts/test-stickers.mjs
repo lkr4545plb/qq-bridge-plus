@@ -11,6 +11,7 @@ import {
   findSticker,
   formatStickerList,
   buildStickerContext,
+  noteScopeVisible,
   buildStickerStrategyHint,
   applyStickerNote,
   markStickerUsed
@@ -156,3 +157,20 @@ if (process.env.QQ_BRIDGE_TEST_LIVE === '1') {
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 if (fail > 0) process.exit(1);
+
+// 6. 备注按会话隔离（2026-11-10，上游 4de160b）：别的会话记下的备注不得出现在本会话提示词里
+{
+  const entry = (id, note, noteScope) => ({ id, note, noteScope, desc: '', tags: [] });
+  const lib = [
+    entry('a', '笑死专用', 'global'),
+    entry('b', 'A群内部梗', 'group:100001'),
+    entry('c', 'B群内部梗', 'group:100002'),
+  ];
+  const ctxA = buildStickerContext(lib, 8, 'group:100001');
+  ok(ctxA.includes('笑死专用') && ctxA.includes('A群内部梗'), 'A 群能看到 global 与本群备注');
+  ok(!ctxA.includes('B群内部梗'), 'A 群看不到 B 群的备注');
+  const ctxC = buildStickerContext(lib, 8, 'group:100003');
+  ok(ctxC.includes('笑死专用'), 'global 备注所有会话可见');
+  ok(!ctxC.includes('A群内部梗') && !ctxC.includes('B群内部梗'), '未归属会话看不到别群备注');
+  ok(noteScopeVisible('global', '') && !noteScopeVisible('group:1', 'group:2'), 'noteScopeVisible 语义正确');
+}

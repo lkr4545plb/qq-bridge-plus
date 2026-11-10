@@ -170,7 +170,7 @@ function verifyHarness({ config = {}, transformSource } = {}) {
     cleanupTemp: () => {},
   });
   const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8').replace(/^export /gm, '');
-  vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { compactModelMessage, compactModelData, serializeModelData }; })());`, context);
+  vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { sanitizeUntrustedText, compactModelMessage, compactModelData, serializeModelData }; })());`, context);
   vm.runInContext(source + '\nglobalThis.verifyReady = main();', context);
   const logFile = path.join(temp, 'state', 'bridge.log');
   const readLog = () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } };

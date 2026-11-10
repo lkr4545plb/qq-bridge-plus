@@ -164,7 +164,7 @@ export async function busyHarness({ config = {}, transformSource = null, globals
     ...globals,
   });
   const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8').replace(/^export /gm, '');
-  vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { compactModelMessage, compactModelData, serializeModelData }; })());`, context);
+  vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { sanitizeUntrustedText, compactModelMessage, compactModelData, serializeModelData }; })());`, context);
   vm.runInContext(source + '\nglobalThis.busyHarnessReady = main();', context);
   const bridge = await context.busyHarnessReady;
   bridge.setPresets(['standard', 'qq-chat', 'qq-chat-v2']);

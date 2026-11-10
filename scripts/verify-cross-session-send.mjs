@@ -221,7 +221,7 @@ async function verifyHarness({ config = {}, transformSource, sourcePath } = {}) 
     Date.now = () => __realDateNow() + globalThis.__clockOffsetMs;
   `, context);
   const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8').replace(/^export /gm, '');
-  vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { compactModelMessage, compactModelData, serializeModelData }; })());`, context);
+  vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { sanitizeUntrustedText, compactModelMessage, compactModelData, serializeModelData }; })());`, context);
   vm.runInContext(source + '\nglobalThis.verifyCrossReady = main();', context);
   const bridge = await context.verifyCrossReady;
   bridge.setPresets(['standard', 'qq-chat', 'qq-chat-v2']);
