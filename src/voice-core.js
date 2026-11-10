@@ -133,15 +133,35 @@ export function safeJoinLibrary(voiceDir, relPath) {
   const abs = path.resolve(root, rel);
   const within = abs === root || abs.startsWith(root + path.sep);
   if (!within) return null;
-  // 符号链接可能指向库外：用 realpath 再校验一次（文件不存在时按父目录判）
-  try {
-    const real = fs.realpathSync(abs);
-    const realRoot = fs.realpathSync(root);
-    if (real !== realRoot && !real.startsWith(realRoot + path.sep)) return null;
-    return real;
-  } catch {
-    return abs;
-  }
+
+  // 符号链接/junction 可能把库内路径指到库外：realpath 后再校验一次。
+  //
+  // 新文件也必须校验**已有的父目录**。旧写法在 realpath(abs) 抛 ENOENT 时直接
+  // `return abs` 放行 —— 这不是"文件不存在所以没有链接"的证明：库内 junction
+  // 指向库外时，尚不存在的输出文件同样会 ENOENT，逃逸被静默放行。
+  const resolveExistingParent = (file) => {
+    const missing = [];
+    let current = file;
+    for (;;) {
+      try {
+        const real = fs.realpathSync(current);
+        return path.join(real, ...missing.reverse());
+      } catch (error) {
+        if (error?.code !== 'ENOENT') return null;
+        const parent = path.dirname(current);
+        if (parent === current) return null;
+        missing.push(path.basename(current));
+        current = parent;
+      }
+    }
+  };
+
+  const realRoot = resolveExistingParent(root);
+  if (!realRoot) return null;
+  const real = resolveExistingParent(abs);
+  if (!real) return null;
+  if (real !== realRoot && !real.startsWith(realRoot + path.sep)) return null;
+  return real;
 }
 
 /**

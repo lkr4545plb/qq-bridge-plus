@@ -72,6 +72,23 @@ console.log('## 安全：路径穿越与文件名净化');
   ok(safeJoinLibrary(lib, '') === null, '拒绝空路径');
   ok(safeJoinLibrary(lib, 'a\0b.mp3') === null, '拒绝含 NUL 的路径');
 
+  // 符号链接/junction 逃逸：**已存在的目标**与**尚不存在的输出文件**都要拒。
+  // 后者是真实回归点：旧实现 realpath(新文件) 抛 ENOENT 时直接放行，库内 junction
+  // 指向库外时，写一个尚不存在的 new.mp3 就绕过了全部校验。
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voice-outside-'));
+  try {
+    fs.writeFileSync(path.join(outsideDir, 'real.mp3'), Buffer.alloc(8, 1));
+    try {
+      fs.symlinkSync(outsideDir, path.join(lib, 'escape'), 'dir');
+    } catch {}
+    if (fs.existsSync(path.join(lib, 'escape'))) {
+      ok(safeJoinLibrary(lib, 'escape/real.mp3') === null, '拒绝经 symlink 指向库外的已存在文件');
+      ok(safeJoinLibrary(lib, 'escape/new.mp3') === null, '拒绝经 symlink 在库外写新文件（父目录在库外）');
+    }
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+
   ok(sanitizeUploadName('../../evil.mp3') === 'evil.mp3', '上传名去掉目录部分');
   ok(sanitizeUploadName('C:\\Windows\\x.mp3') === 'x.mp3', '上传名去掉 Windows 路径');
   ok(sanitizeUploadName('a<b>c?.mp3') === 'a_b_c_.mp3', '上传名净化非法字符');
