@@ -424,6 +424,30 @@ function forgetAgentToken(key) {
   CONVERSATION_TOKENS.delete(key);
 }
 
+// ── 令牌片段闸门（上游 28bf1de + 4ed0142 parity）────────────────────────────
+//
+// 为什么需要片段匹配（不只是整串）：整串匹配只拦得住"一次性把整个 token 发出去"。
+// 模型只要把令牌拆成两段各发一条，每段都短于整串，逐条闸门就全部放行；接收方按顺序
+// 拼回去仍是完整令牌 —— 这是真实的凭据外带路径，不是理论问题。
+//
+// 12 字符窗口是权衡值：长到在日常聊天里不会误伤（随机 12 字符 hex 段碰撞概率可忽略），
+// 又足够短到拆条后每一段仍能命中。窗口数 = token.length - 11，32 位 hex 即每个 token
+// 最多 21 个窗口。
+const TOKEN_FRAGMENT_WIDTH = 12;
+
+/** 文本里是否出现任一已知 token 的任意 12 字符窗口。 */
+function hasKnownTokenFragment(text) {
+  const value = String(text ?? '');
+  if (!value) return false;
+  for (const token of KNOWN_AGENT_TOKENS) {
+    if (!token || token.length < TOKEN_FRAGMENT_WIDTH) continue;
+    for (let i = 0; i + TOKEN_FRAGMENT_WIDTH <= token.length; i += 1) {
+      if (value.includes(token.slice(i, i + TOKEN_FRAGMENT_WIDTH))) return true;
+    }
+  }
+  return false;
+}
+
 // 读取 DSH 模型能力的在途 Promise：withTimeout 只做 Promise.race，不会取消底层 RPC，
 // 因此并发刷新会各自留下一个不可取消的请求。这里做去重，同一时刻只发一个。
 let modelCatalogInFlight = null;
@@ -954,7 +978,7 @@ async function main() {
    */
   function assertOutboundAuditOk(key, subject) {
     const text = String(subject ?? '');
-    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && text.includes(t));
+    const hasKnownToken = hasKnownTokenFragment(text);
     if (shouldAuditKey(key) && (SENSITIVE_RE.test(text) || hasKnownToken)) {
       log(`⚠️ 语音发送被安全策略拦截 (${key})：${hasKnownToken ? '文件名含会话令牌' : '文件名疑似含敏感信息'}`);
       appendActivity(`${key} [voice] 发送被拦截（文件名疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
@@ -9959,7 +9983,9 @@ async function main() {
     for (const token of KNOWN_AGENT_TOKENS) {
       if (token && s.includes(token)) s = s.split(token).join('***');
     }
-    return s;
+    // 整串替换后仍检出片段 ⇒ 这条消息里带着"半个令牌"（拆条发送的其中一段），
+    // 必须整条替换，否则两条拼起来仍是完整令牌。
+    return hasKnownTokenFragment(s) ? '***' : s;
   }
 
   // 最近一次发送是否全部成功（按 key）。调用方据此决定要不要刷新「我发过言了」的时间戳 ——
@@ -10058,7 +10084,7 @@ async function main() {
       segments.push({ type: 'at', data: { qq: at } });
     }
     const rawMessage = String(message ?? '');
-    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && rawMessage.includes(t));
+    const hasKnownToken = hasKnownTokenFragment(rawMessage);
     if (hasKnownToken) {
       log(`发送内容包含会话令牌，已阻止发送 (${kind}:${id})`);
       throw new Error('发送内容包含会话令牌，已阻止发送');
@@ -10375,6 +10401,14 @@ async function main() {
   }
 
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
+    // 先审计整批：令牌可被拆成多段，每段都短于逐条闸门的 12 字符窗口。
+    // 必须在发送第一段前拒绝；onebotSend 仍会在实际发送时再次检查单条。
+    // 为什么用 join('')：拆条发送时消息本身已被逐条 trim，把批次拼回去才是接收方
+    // 看到的完整文本（若用带分隔符的 join，拆点处会多出一个空格，窗口就命不中）。
+    if (hasKnownTokenFragment(messages.join(''))) {
+      log(`发送内容包含会话令牌，已阻止整批发送 (${key})`);
+      return Promise.reject(new Error('发送内容包含会话令牌，已阻止发送'));
+    }
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
     const sent = [];
@@ -10437,7 +10471,7 @@ async function main() {
 
   // 统一出站消息：先完整文本审计，再发送。返回是否真的发出。
   async function auditAndSend(key, text) {
-    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && String(text ?? '').includes(t));
+    const hasKnownToken = hasKnownTokenFragment(text);
     if (shouldAuditKey(key) && (SENSITIVE_RE.test(text) || hasKnownToken)) {
       log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
       appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
@@ -14756,7 +14790,7 @@ async function main() {
                   continue;
                 }
                 // 审计（对完整文本执行，避免截断漏判；这里只判断，不发送，避免双重发送）
-                const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && plain.includes(t));
+                const hasKnownToken = hasKnownTokenFragment(plain);
                 if (shouldAuditKey(key) && (SENSITIVE_RE.test(plain) || hasKnownToken)) {
                   log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
                   appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
