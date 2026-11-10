@@ -113,7 +113,7 @@ test('默认配置：loadConfig 的全部默认值', () => {
   });
 
   assert.equal(config.socialV2.wake.defaultMode, 'diving');
-  assert.equal(config.socialV2.wake.preSleepWaitMs, 300000);
+  assert.equal(config.socialV2.wake.preSleepWaitMs, 120000);
   assert.equal(config.socialV2.wake.recommendedDefaultInfinite, true);
   assert.equal(config.socialV2.wake.batchWindowMs, 8000);
 

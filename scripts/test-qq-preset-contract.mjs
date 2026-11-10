@@ -46,7 +46,7 @@ test('one closing action can acknowledge the read watermark after the full obser
   assert.match(prefix, /qq_mark_read\(throughSeq=/);
   assert.match(prefix, /qq_set_wake_config\(config=[^)]*throughSeq=/);
   assert.match(prefix, /不需先 mark_read/);
-  assert.match(prefix, /qq_wait_for_messages\(timeoutMs=300000\)/);
+  assert.match(prefix, /qq_wait_for_messages\(timeoutMs=120000\)/);
   assert.match(prefix, /短等待不能代替/);
   assert.match(prefix, /preSleepWaitRemainingMs[^。]*继续等待/);
   assert.match(prefix, /若你参与回复[^。]*重新观察/);
@@ -65,7 +65,7 @@ test('pre-reply quiet checks, waiting for replies and pre-sleep observation have
   assert.match(prefix, /【等下文】[^\n]*purpose="messages", timeoutMs=60000~120000/);
   assert.match(prefix, /【回复后】[^\n]*qq_wait_for_messages\(purpose="messages"\)/);
   assert.match(prefix, /短静默不算沉睡前观察/);
-  assert.match(prefix, /5 分钟观察不是回复的前置条件/);
+  assert.match(prefix, /2 分钟观察不是回复的前置条件/);
   assert.match(prefix, /只有准备收尾时[^。]*preSleepWaitRemainingMs/);
 });
 
@@ -86,8 +86,9 @@ test('social autonomy and visual, forwarding, sticker and web capabilities remai
 test('autonomy limits and the observation escape hatch stay described', () => {
   // These rules were previously unguarded: deleting any of them left every test green.
   for (const text of [
-    // 沉睡前观察唯一的逃生口：明确结束语可以跳过 5 分钟等待。
-    '除非对方明确“不聊了/晚安/下了/拜拜”等结束语',
+    // 收尾回潜水：mark_read 直接收尾（产品决策 2026-11-10 起不再强制先观察），
+    // 观察降为「更稳妥」的可选项——删掉这句会让 AI 又以为必须先等观察窗口。
+    '会直接收尾回潜水，不再强制先完成观察',
     // [SILENT] 是桥接的退出标记，误用会静默吞掉回复。
     '不要用 [SILENT]',
     // 记忆面

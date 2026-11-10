@@ -134,17 +134,24 @@ await test('my-recent returns an existing safe cursor without authorizing unrela
   assert.deepEqual(seqs(st.unread), [1]);
 });
 
-await test('combined close cannot bypass the pre-sleep observation guard', async ({ st, request, append }) => {
+await test('mark_read dives directly; wake-config keeps the observation guard', async ({ st, request, append }) => {
+  // 2026-11-10 产品决策：qq_mark_read 直接收尾回潜水，不再强制先完成沉睡前观察；
+  // 观察窗口只保留给 qq_set_wake_config（潜水配置）这条路径。
   append('still discussing a normal topic');
   const read = await request('unread');
+  const direct = await request('mark-read', { body: { throughSeq: read.data.readThroughSeq } });
+  assert.equal(direct.status, 200, `mark_read 应直接放行：${JSON.stringify(direct.data)}`);
+  assert.equal(direct.data.markedCount, 1, '直接收尾也要真的标记已读');
+  assert.deepEqual(seqs(st.unread), [], '未读应被清空');
+
+  // ② 带潜水配置的 wake-config 仍受观察闸约束（默认 2 分钟）
+  append('another normal topic');
+  const read2 = await request('unread');
   const before = plain(st.wakeConfig);
-  for (const route of ['mark-read', 'wake-config']) {
-    const result = await request(route, { body: { throughSeq: read.data.readThroughSeq, config: DIVING } });
-    assert.equal(result.status, 400);
-    assert.ok(result.data.preSleepWaitRemainingMs > 0);
-    assert.deepEqual(seqs(st.unread), [1]);
-    assert.deepEqual(plain(st.wakeConfig), before);
-  }
+  const blocked = await request('wake-config', { body: { throughSeq: read2.data.readThroughSeq, config: DIVING } });
+  assert.equal(blocked.status, 400, 'wake-config 潜水配置仍要求先完成观察');
+  assert.ok(blocked.data.preSleepWaitRemainingMs > 0);
+  assert.deepEqual(plain(st.wakeConfig), before, '被拒时不得改写唤醒配置');
 }, { observe: true });
 
 await test('a full quiet observation allows a single combined close', async ({ h, st, request, append }) => {

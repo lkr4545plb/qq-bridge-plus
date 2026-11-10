@@ -113,7 +113,7 @@ export const legacyPreSleepWaitBlocked = Object.freeze(function legacyPreSleepWa
   if (!st) return false;
   if (w.preSleepWaitEnabled === false) return false;
   if (legacyHasExplicitEnd(st)) return false;
-  const waitMs = Math.max(0, Number(w.preSleepWaitMs) || 300000);
+  const waitMs = Math.max(0, Number(w.preSleepWaitMs) || 120000);
   const at = now();
   if ((st.lastIncomingAt || 0) && at - st.lastIncomingAt >= waitMs) return false;
   if (st.preSleepWaitSatisfiedAt && (!st.lastIncomingAt || st.lastIncomingAt <= st.preSleepWaitSatisfiedAt)) return false;

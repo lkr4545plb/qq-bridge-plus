@@ -646,11 +646,11 @@ test('[contract] preSleepWaitBlocked clock budget and read order', () => {
   assert.equal(blockedCaps.trace.now.length, 1, 'blocked path reads clock once');
 
   const equalCaps = makeCaps({ nowValues: [BASE] }, []);
-  assert.equal(fn({ lastIncomingAt: BASE - 300000 }, {}, equalCaps), false, 'boundary equality releases');
+  assert.equal(fn({ lastIncomingAt: BASE - 120000 }, {}, equalCaps), false, 'boundary equality releases');
   assert.equal(equalCaps.trace.now.length, 1, 'boundary reads clock once');
 
   const underCaps = makeCaps({ nowValues: [BASE] }, []);
-  assert.equal(fn({ lastIncomingAt: BASE - 299999 }, {}, underCaps), true, 'one ms under blocks');
+  assert.equal(fn({ lastIncomingAt: BASE - 119999 }, {}, underCaps), true, 'one ms under blocks');
   assert.equal(underCaps.trace.now.length, 1, 'one ms under reads clock once');
 
   const throwingConfig = traced({}, []);

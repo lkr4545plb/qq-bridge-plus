@@ -78,7 +78,7 @@ export function preSleepWaitBlocked(st, w, { now }) {
   if (!st) return false;
   if (w.preSleepWaitEnabled === false) return false;
   if (hasExplicitEnd(st)) return false;
-  const waitMs = Math.max(0, Number(w.preSleepWaitMs) || 300000);
+  const waitMs = Math.max(0, Number(w.preSleepWaitMs) || 120000);
   const at = now();
   // 已经连续安静满观察窗口：可以直接设置潜水。
   if ((st.lastIncomingAt || 0) && at - st.lastIncomingAt >= waitMs) return false;
