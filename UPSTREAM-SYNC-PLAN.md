@@ -68,8 +68,15 @@ test-dsh-cli-resolve、test-dsh-discovery-logging）；test-quick 64/66（同两
 test-md / test-forward / test-audit-security / test-audit-security-mcp / test-mcp-web-search /
 token-economy 全绿（改动后无回归，已用 stash 做过基线对比）。
 
-### 下一批（批次 2 候选，按优先级）
-1. 令牌拆条绕过（4ed0142+28bf1de）— bridge.js sendMessagesV2/onebotSend + mcp-snowluma-safe
+### 批次 2 进度
+
+#### 已完成
+- ✅ **令牌拆条绕过**（4ed0142+28bf1de，commit d62751f）— bridge.js 片段闸门 +
+  整批审计 + redactKnownTokensOnly 整条替换；新增 test-token-fragment-guard.mjs
+  （未修复代码上实测拆两段 HTTP 200，修复后全拒）；审计 107/110（失败集=既有 3 项）
+
+#### 待办（按优先级）
+1. sanitizeUntrustedText（1d6f889）— qq-model-view + bridge 接线
 2. sanitizeUntrustedText（1d6f889）— qq-model-view + bridge 接线
 3. 消息幂等入库 + 撤回事件（90b413b）— bridge.js
 4. forward-media 会话校验（4d19073）— bridge.js 侧（forward 端点侧本地已有部分）
