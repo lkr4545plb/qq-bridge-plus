@@ -75,6 +75,14 @@ token-economy 全绿（改动后无回归，已用 stash 做过基线对比）�
   整批审计 + redactKnownTokensOnly 整条替换；新增 test-token-fragment-guard.mjs
   （未修复代码上实测拆两段 HTTP 200，修复后全拒）；审计 107/110（失败集=既有 3 项）
 
+- ✅ **dsh-client 思考强度**（aa0b80b，commit 757b765）— normalize 放宽 + none 标记 +
+  GET options 跟随目录 + ensureChatModel 两段式降级（拒绝档位即换无 effort 段）
+- ✅ **safe-fetch 端口白名单周边**（commit 23bff19）— resolveTarget/validateFetchUrl
+  支持 allowPorts；多地址重试（IPv4 优先/8s 软预算/最多 4 地址）修「表情包时好时坏」
+  根因；Azure WireServer 168.63.129.16 拦截；保留 t78 头部追加能力
+- ✅ **voice-core 双向合并**（commit f66ae94）— resolveExistingParent 校验已有父目录
+  （修 junction 逃逸漏判）；保留本地 fd 重定向 EPERM 修复；test-voice-gui +2 用例（旧代码 21/1）
+
 #### 待办（按优先级）
 1. sanitizeUntrustedText（1d6f889）— qq-model-view + bridge 接线
 2. sanitizeUntrustedText（1d6f889）— qq-model-view + bridge 接线
