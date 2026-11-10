@@ -89,6 +89,16 @@ token-economy 全绿（改动后无回归，已用 stash 做过基线对比）�
 - ✅ **voice-core 双向合并**（commit f66ae94）— resolveExistingParent 校验已有父目录
   （修 junction 逃逸漏判）；保留本地 fd 重定向 EPERM 修复；test-voice-gui +2 用例（旧代码 21/1）
 
+- ✅ **批次 2 全部完成**（2026-11-10）：
+  · sanitizeUntrustedText（1d6f889）qq-model-view + bridge 7 处接线
+  · 表情备注/黑话会话隔离（4de160b）sticker-lib/slang-learner scope + bridge key 贯通
+  · 消息幂等 + 撤回事件（90b413b）
+  · 执行期会话绑定（040f159+6455d60）qq-self-key.mjs + qqb-* sessionId + guard 校验
+  · sleep 钳制（6ccee53）、wait retryAfterMs（2649f94）、state-acl hasPermissionGrant、
+    token-ledger evictionCovered、错误外发收紧（239e6b9）、#93 batchWindowMs（176433a）、
+    stop-bridge-instance + restart.bat（0ac4233/0b2b373）
+  · privacy-scan（2aca5a3）不适用（本地结构不同，记录跳过）
+
 #### 待办（按优先级）
 1. sanitizeUntrustedText（1d6f889）— qq-model-view + bridge 接线
 2. sanitizeUntrustedText（1d6f889）— qq-model-view + bridge 接线
