@@ -166,6 +166,25 @@ test('a bridge 200 with ok:false is reported to the model as a failure', async (
   assert.match(result.content[0].text, /阻止发送/);
 });
 
+// 回归：qq_set_effort 是 agent 自服务权限 —— 必须打到 /api/socialV2/effort（本会话），
+// 且按约定带 x-agent-token；绝不能打到管理员的 /api/dsh/effort（全局档位）。
+test('qq_set_effort posts to the session-scoped effort endpoint with the agent token', async () => {
+  const seen = [];
+  const callTool = loadSnowlumaTools(async (url, init) => {
+    seen.push({ url: String(url), body: init?.body, headers: init?.headers });
+    return Response.json({ ok: true, key: 'group:456', reasoningEffort: 'high', previous: 'max', effective: 'high' });
+  });
+  const result = await callTool('qq_set_effort', { key: 'group:456', token: 'fixture-agent-token', effort: 'high' });
+  assert.notEqual(result.isError, true, '正常返回不得是错误');
+  assert.equal(seen.length, 1);
+  assert.match(seen[0].url, /\/api\/socialV2\/effort$/);
+  assert.equal(seen[0].headers['x-agent-token'], 'fixture-agent-token');
+  const body = JSON.parse(String(seen[0].body));
+  assert.equal(body.key, 'group:456');
+  assert.equal(body.effort, 'high');
+  assert.ok(!/\/api\/dsh\/effort/.test(seen[0].url), '不得走管理员全局端点');
+});
+
 // 回归：旧只读工具没有会话令牌，只能用在封闭 agent（管理员私聊）里。
 // 桥接的 /api/status 对「带 agent 令牌」的调用返回最小对象（不含 mode 字段），
 // 于是「看到 reserved2 才拒绝」的黑名单写法会判定为假 ⇒ 在二代仿真模式下放行，

@@ -559,6 +559,24 @@ server.tool(
 );
 
 server.tool(
+  'qq_set_effort',
+  '设置**当前会话**的思考强度（只影响你这个会话下一条消息开始的 selectModel，别的会话与全局默认不受影响）。effort 传 none = 清掉本会话覆盖、回到全局档位。桥接按会话令牌做绑定：你只能改自己这个 key；档位 id 由 DSH 目录定义（DeepSeek 是 low/high/max，自定义模型可能是 medium/xhigh 等），传了模型不支持的档位时桥接会自动降级为不下发 effort。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    effort: z.string().describe('思考强度档位 id（如 low/high/max/medium/xhigh；none=清掉本会话覆盖、跟随全局）')
+  },
+  async ({ key, token, effort }) => {
+    try {
+      const data = await agentApi('/api/socialV2/effort', { method: 'POST', body: JSON.stringify({ key, effort }), headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `设置思考强度失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
   'qq_send_burst',
   '在指定 QQ 群分多条发送消息（二代仿真模式专用），桥接会按真人化随机间隔发送。暂不支持引用，需要引用请用 qq_reply。注意：数组里的每个字符串就是一条 QQ 消息，字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。',
   {

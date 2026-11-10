@@ -6469,7 +6469,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'sendImage', 'tiebaList', 'tiebaRead', 'patrol'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'setEffort', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'sendImage', 'tiebaList', 'tiebaRead', 'patrol'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6764,6 +6764,7 @@ async function main() {
             getActiveMembers: 'qq_get_active_members',
             setWakeConfig: 'qq_set_wake_config',
             markRead: 'qq_mark_read',
+            setEffort: 'qq_set_effort',
             memory: 'qq_memory_append / qq_memory_query / qq_memory_remove / qq_memory_clear',
             slangQuery: 'qq_slang_query',
             slangSubmit: 'qq_slang_submit',
@@ -7079,6 +7080,43 @@ async function main() {
           saveSocialV2State();
           log(`[reserved2] 控制台/工具标记 ${key} 未读已读：${markedCount} 条，已确认下一次唤醒配置`);
           sendJson({ ok: true, key, markedCount, unreadCount: st.unread.length, readThroughSeq: readThroughSeqV2(st), wakeGuaranteed: computeWakeSafetyV2(st.wakeConfig).guaranteed, wakeSafety: computeWakeSafetyV2(st.wakeConfig), wakeConfig: st.wakeConfig });
+          return;
+        }
+        // agent 自服务：设置**本会话**的思考强度（只写当前 key 的覆盖档位）。
+        // 与管理员 /api/dsh/effort 的区别：这里永远不碰全局档位（config.dsh.reasoningEffort），
+        // 且被 agent token 的会话绑定钉死——令牌只对它自己的 key 有效，改不了别人的会话。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/effort') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('setEffort')) { sendJson({ ok: false, error: '工具未启用：qq_set_effort' }, 403); return; }
+          let effort;
+          try { effort = normalizeReasoningEffort(body.effort); }
+          catch (error) { sendJson({ ok: false, error: error?.message ?? '思考强度无效' }, 400); return; }
+          const configFile = path.join(ROOT, 'config.json');
+          const file = readConfigObject(configFile);
+          if (!file.socialV2 || typeof file.socialV2 !== 'object' || Array.isArray(file.socialV2)) file.socialV2 = {};
+          const rawTable = file.socialV2.modelOverrides;
+          const table = (rawTable && typeof rawTable === 'object' && !Array.isArray(rawTable)) ? { ...rawTable } : {};
+          const rawEntry = table[key];
+          const entry = (rawEntry && typeof rawEntry === 'object' && !Array.isArray(rawEntry)) ? { ...rawEntry } : {};
+          const previous = typeof entry.reasoningEffort === 'string' && entry.reasoningEffort.trim() ? entry.reasoningEffort.trim() : '';
+          // none = 清掉本会话覆盖，回到全局档位（与「覆盖项没写 effort」语义一致）。
+          if (effort === REASONING_EFFORT_NONE) delete entry.reasoningEffort;
+          else entry.reasoningEffort = effort;
+          if (Object.keys(entry).length) table[key] = entry;
+          else delete table[key];
+          file.socialV2.modelOverrides = table;
+          atomicWriteJson(configFile, file);
+          // 内存同步（下一条消息的 modelSelectionFor 读的是 cfg）+ 递增代号让已有会话重新 selectModel。
+          cfg.socialV2 = { ...(cfg.socialV2 ?? {}), modelOverrides: table };
+          modelSelectionEpoch += 1;
+          const shown = effort === REASONING_EFFORT_NONE ? '(跟随全局)' : effort;
+          log(`Agent 设定思考强度 ${key}: ${previous || '(跟随全局)'} → ${shown}`);
+          appendActivity(`${key} [effort] 思考强度 ${previous || '(跟随全局)'} → ${shown}`);
+          sendJson({ ok: true, key, reasoningEffort: effort === REASONING_EFFORT_NONE ? null : effort, previous: previous || null, effective: shown });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/wake-config') {

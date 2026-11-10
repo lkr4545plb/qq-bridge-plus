@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 
 let failures = 0;
 async function test(name, run) {
@@ -434,6 +436,61 @@ await test('malformed HTTP request targets return 400 without hanging', async (h
     assert.equal(noToken.status, 403, '空会话令牌必须被拒绝');
     console.log('PASS console rejects foreign Host headers, non-exact tokens and token-less authorize/read');
   } catch (error) { failures++; console.error('FAIL console transport guards:', error.message); }
+  finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
+}
+
+// ── agent 自服务：qq_set_effort 只允许改**自己会话**的档位，全局仍归管理员 ──────
+{
+  const h = await bridgeHarness();
+  h.setMode('reserved2');
+  const server = h.startConsoleServer();
+  try {
+    if (!server.listening) await new Promise((resolve) => server.once('listening', resolve));
+    const port = server.address().port;
+    const post = (pathname, headers, body) => new Promise((resolve, reject) => {
+      const request = http.request({ host: '127.0.0.1', port, path: pathname, method: 'POST', headers: { 'content-type': 'application/json', ...headers } }, (response) => {
+        let data = '';
+        response.on('data', (chunk) => { data += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, body: data }));
+      });
+      request.on('error', reject);
+      request.setTimeout(3000, () => request.destroy(new Error('request hung')));
+      request.end(body === undefined ? undefined : JSON.stringify(body));
+    });
+    const ownKey = 'private:123';
+    const token = String(h.getSocialV2State(ownKey)?.agentToken ?? '');
+    assert.ok(token.length >= 24, '夹具必须拿到会话令牌');
+    const readConfig = () => JSON.parse(fs.readFileSync(path.join(h.temp, 'config.json'), 'utf8'));
+    const agentHeaders = { 'x-console-token': 'fixture-console-token', 'x-agent-token': token };
+
+    // ① 自己的会话：设置档位 → 200，并落盘到本会话覆盖项（不是全局）
+    let res = await post('/api/socialV2/effort', agentHeaders, { key: ownKey, effort: 'medium' });
+    assert.equal(res.status, 200, `应允许改自己会话：${res.body}`);
+    assert.equal(readConfig().socialV2.modelOverrides?.[ownKey]?.reasoningEffort, 'medium', '必须落盘到本会话覆盖项');
+    assert.equal(readConfig().dsh?.reasoningEffort === 'medium', false, '不得改全局档位');
+
+    // ② 别的会话：同一令牌 → 403（会话绑定），且不得写入
+    res = await post('/api/socialV2/effort', agentHeaders, { key: 'group:456', effort: 'high' });
+    assert.equal(res.status, 403, `不能改别的会话：${res.body}`);
+    assert.equal(readConfig().socialV2.modelOverrides?.['group:456']?.reasoningEffort, undefined, '别的会话不得被写入');
+
+    // ③ none → 清掉本会话覆盖（回到全局）
+    res = await post('/api/socialV2/effort', agentHeaders, { key: ownKey, effort: 'none' });
+    assert.equal(res.status, 200, `none 应被接受：${res.body}`);
+    assert.equal(readConfig().socialV2.modelOverrides?.[ownKey]?.reasoningEffort, undefined, 'none 必须清掉本会话覆盖');
+
+    // ④ 非法档位 → 400
+    res = await post('/api/socialV2/effort', agentHeaders, { key: ownKey, effort: 'has space' });
+    assert.equal(res.status, 400, '非法档位必须被拒');
+
+    // ⑤ 全局端点仍只属于管理员：agent token 一律 403
+    res = await post('/api/dsh/effort', { 'x-agent-token': token }, { reasoningEffort: 'high' });
+    // 只带 agent token 时先撞控制台鉴权（401）；带齐控制台+agent 令牌才走到 403。
+    // 两者都是「拒绝」，断言只要求不是 200。
+    assert.notEqual(res.status, 200, `agent 不得改全局档位：${res.status} ${res.body}`);
+
+    console.log('PASS agent can set its own effort but cannot touch other sessions or the global default');
+  } catch (error) { failures++; console.error('FAIL agent effort self-service:', error.message); }
   finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
 }
 

@@ -105,7 +105,7 @@ test('默认配置：loadConfig 的全部默认值', () => {
     sendGroup: true, sendPrivate: true, reply: true, sendBurst: true,
     sendMessage: true, waitMessages: true, feedback: true, getMyRecent: true,
     getMessageDetail: true, getActiveMembers: true, setWakeConfig: true,
-    markRead: true, memory: true, slangQuery: true, slangSubmit: true,
+    markRead: true, setEffort: true, memory: true, slangQuery: true, slangSubmit: true,
     getImages: true, getForwardMsg: true, sendPoke: true, listStickers: true,
     getStickerImage: true, sendSticker: true, setStickerRemark: false,
     stickerNote: true, collectSticker: true, getSelfImage: true,
